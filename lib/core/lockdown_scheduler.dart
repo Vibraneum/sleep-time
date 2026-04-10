@@ -45,7 +45,8 @@ class LockdownScheduler {
   }
 
   void start() {
-    _updateState();
+    // Defer first update so it doesn't fire during initState/build
+    Timer(Duration.zero, _updateState);
     _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _updateState());
   }
 

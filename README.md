@@ -77,6 +77,8 @@ Current Windows behavior includes:
 - fullscreen lockdown
 - prevent-close integration
 - taskbar hiding during lockdown
+- best-effort shell suppression during active lockdown
+- startup cleanup if a prior locked session crashed
 - release packaging through GitHub Actions
 
 ## Android notes
@@ -91,7 +93,8 @@ Use the GitHub Actions **Manual Release** workflow and provide a version like `0
 That workflow will:
 - run analyze + test
 - optionally create the tag
-- build the Windows release artifact
+- build the Windows portable artifact
+- build a Windows installer
 - publish the GitHub Release
 
 ## Security notes
@@ -99,6 +102,7 @@ That workflow will:
 - Do not commit real API keys.
 - `.env` files are ignored.
 - Windows enforcement can be bypassed by determined local administrators.
+- Ctrl+Alt+Del and other secure attention paths are not fully controllable by a normal desktop app.
 - See `SECURITY.md` for reporting guidance and threat-model limits.
 
 ## Repository docs

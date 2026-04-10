@@ -41,6 +41,7 @@ dependencies:
   shared_preferences: ^2.5.5
   intl: ^0.20.2
   window_manager: ^0.5.1
+  sqflite_common_ffi: ^2.4.0+2
 
 dev_dependencies:
   flutter_test:

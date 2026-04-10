@@ -1,5 +1,8 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:window_manager/window_manager.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/negotiation_engine.dart';
 import '../core/config.dart';
@@ -14,7 +17,7 @@ class LockdownScreen extends StatefulWidget {
 }
 
 class _LockdownScreenState extends State<LockdownScreen>
-    with TickerProviderStateMixin {
+    with TickerProviderStateMixin, WindowListener {
   final _engine = NegotiationEngine();
   final _keyboardFocusNode = FocusNode();
   bool _showChat = false;
@@ -23,6 +26,9 @@ class _LockdownScreenState extends State<LockdownScreen>
   @override
   void initState() {
     super.initState();
+    if (Platform.isWindows) {
+      windowManager.addListener(this);
+    }
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 3),
@@ -34,6 +40,9 @@ class _LockdownScreenState extends State<LockdownScreen>
 
   @override
   void dispose() {
+    if (Platform.isWindows) {
+      windowManager.removeListener(this);
+    }
     _pulseController.dispose();
     _keyboardFocusNode.dispose();
     _engine.dispose();
@@ -43,6 +52,15 @@ class _LockdownScreenState extends State<LockdownScreen>
   void _onGranted(int minutes) {
     widget.scheduler.grantExtension(minutes);
     setState(() => _showChat = false);
+  }
+
+  @override
+  Future<void> onWindowClose() async {
+    if (widget.scheduler.state == LockdownState.locked) {
+      await windowManager.focus();
+      return;
+    }
+    await windowManager.destroy();
   }
 
   @override

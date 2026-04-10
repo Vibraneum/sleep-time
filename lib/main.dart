@@ -1,8 +1,10 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
+import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
 
@@ -35,9 +37,14 @@ Future<void> _loadConfig() async {
   }
 
   AppConfig.geminiModel =
-      prefs.getString('gemini_model') ?? 'gemini-2.5-flash';
+      prefs.getString('gemini_model') ?? 'gemini-3-flash-preview';
   AppConfig.anthropicModel =
-      prefs.getString('anthropic_model') ?? 'claude-3-5-sonnet-latest';
+      prefs.getString('anthropic_model') ?? 'claude-haiku-4-5-20251001';
+
+  AppConfig.simulateLockdown = const bool.fromEnvironment(
+    'SIMULATE_LOCKDOWN',
+    defaultValue: false,
+  );
 
   AppConfig.wakeUpHour = prefs.getInt('wakeup_hour') ?? 22;
   AppConfig.wakeUpMinute = prefs.getInt('wakeup_minute') ?? 30;
@@ -58,8 +65,15 @@ Future<void> _loadConfig() async {
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // Initialize sqflite FFI for Windows/Linux desktop
+  if (Platform.isWindows || Platform.isLinux) {
+    sqfliteFfiInit();
+    databaseFactory = databaseFactoryFfi;
+  }
+
   if (Platform.isWindows) {
     await windowManager.ensureInitialized();
+    await WindowsLockdown.restoreSystemState();
     await windowManager.setTitle('Sleep Time');
     await windowManager.setMinimumSize(const Size(420, 680));
     await windowManager.setSize(const Size(420, 740));

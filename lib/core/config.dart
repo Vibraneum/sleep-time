@@ -8,8 +8,9 @@ class AppConfig {
   static String pokeApiKey = '';
   static AiProvider aiProvider = AiProvider.gemini;
   static bool useBringYourOwnKey = false;
-  static String geminiModel = 'gemini-2.5-flash';
-  static String anthropicModel = 'claude-3-5-sonnet-latest';
+  static String geminiModel = 'gemini-3-flash-preview';
+  static String anthropicModel = 'claude-haiku-4-5-20251001';
+  static bool simulateLockdown = false;
 
   // Schedule — all configurable
   static int wakeUpHour = 22; // 10:30 PM — guardian wakes up
@@ -80,6 +81,7 @@ class AppConfig {
   }
 
   static bool isLockdownTime([DateTime? now]) {
+    if (simulateLockdown) return true;
     final time = now ?? DateTime.now();
     return _isWithinWindow(
       startMinutes: _minutesOfDay(lockdownHour, lockdownMinute),
