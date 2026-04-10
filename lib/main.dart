@@ -4,7 +4,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
-import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
 
@@ -73,7 +72,6 @@ Future<void> main() async {
 
   if (Platform.isWindows) {
     await windowManager.ensureInitialized();
-    await WindowsLockdown.restoreSystemState();
     await windowManager.setTitle('Sleep Time');
     await windowManager.setMinimumSize(const Size(420, 680));
     await windowManager.setSize(const Size(420, 740));

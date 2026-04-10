@@ -49,3 +49,10 @@ Please preserve support for:
 
 Never commit real API keys or secrets.
 Review `SECURITY.md` before reporting vulnerabilities.
+
+## Windows behavior
+
+Before changing Windows enforcement, read:
+- `CURRENT_STATE.md`
+- `docs/WINDOWS_THREAT_MODEL.md`
+- `docs/WINDOWS_PACKAGING_AND_SIGNING.md`

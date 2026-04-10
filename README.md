@@ -107,8 +107,11 @@ That workflow will:
 
 ## Repository docs
 
+- `CURRENT_STATE.md`
 - `CONTRIBUTING.md`
 - `CHANGELOG.md`
 - `SECURITY.md`
 - `CODE_OF_CONDUCT.md`
 - `REVIEW.md`
+- `docs/WINDOWS_THREAT_MODEL.md`
+- `docs/WINDOWS_PACKAGING_AND_SIGNING.md`

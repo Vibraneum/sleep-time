@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:window_manager/window_manager.dart';
 
 /// Windows-specific lockdown. This is best-effort only; a determined local
@@ -101,7 +102,10 @@ class WindowsLockdown {
       1,
     );
 
-    await _killExplorer();
+    // Only kill explorer in release mode — debug/profile need it for DevTools
+    if (kReleaseMode) {
+      await _killExplorer();
+    }
 
     _refocusTimer?.cancel();
     _refocusTimer = Timer.periodic(const Duration(seconds: 2), (_) async {

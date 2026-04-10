@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:http/http.dart' as http;
@@ -17,6 +18,48 @@ class GuardianDecision {
     this.granted = false,
     this.minutesGranted = 0,
   });
+}
+
+@visibleForTesting
+GuardianDecision parseGuardianDecision(String response) {
+  for (final line in response.trim().split('\n').reversed) {
+    final trimmed = line.trim();
+    if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
+    try {
+      final json = jsonDecode(trimmed) as Map<String, dynamic>;
+      final decision = (json['decision'] as String?)?.toLowerCase();
+      if (decision == 'grant') {
+        final minutes = AppConfig.sanitizeGrantedMinutes(
+          (json['minutes'] as num?)?.toInt() ?? 5,
+        );
+        return GuardianDecision(
+          message: cleanGuardianResponse(response),
+          granted: true,
+          minutesGranted: minutes,
+        );
+      }
+      if (decision == 'deny' || decision == 'lock') {
+        return GuardianDecision(message: cleanGuardianResponse(response));
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+  return GuardianDecision(message: cleanGuardianResponse(response));
+}
+
+@visibleForTesting
+String cleanGuardianResponse(String response) {
+  final cleaned = response
+      .trim()
+      .split('\n')
+      .where((line) {
+        final trimmed = line.trim();
+        return !(trimmed.startsWith('{') && trimmed.contains('"decision"'));
+      })
+      .join('\n')
+      .trim();
+  return cleaned.isEmpty ? 'no.' : cleaned;
 }
 
 class NegotiationEngine {
@@ -106,8 +149,8 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
     ));
 
     final responseText = await _sendToProvider(userMessage);
-    final cleanMessage = _cleanResponse(responseText);
-    final parsed = _parseDecision(responseText);
+    final cleanMessage = cleanGuardianResponse(responseText);
+    final parsed = parseGuardianDecision(responseText);
 
     await MemoryService.saveMessage(ConversationMessage(
       role: 'guardian',
@@ -179,45 +222,6 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
     return reply;
   }
 
-  GuardianDecision _parseDecision(String response) {
-    for (final line in response.trim().split('\n').reversed) {
-      final trimmed = line.trim();
-      if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
-      try {
-        final json = jsonDecode(trimmed) as Map<String, dynamic>;
-        final decision = (json['decision'] as String?)?.toLowerCase();
-        if (decision == 'grant') {
-          final minutes = AppConfig.sanitizeGrantedMinutes(
-            (json['minutes'] as num?)?.toInt() ?? 5,
-          );
-          return GuardianDecision(
-            message: _cleanResponse(response),
-            granted: true,
-            minutesGranted: minutes,
-          );
-        }
-        if (decision == 'deny' || decision == 'lock') {
-          return GuardianDecision(message: _cleanResponse(response));
-        }
-      } catch (_) {
-        continue;
-      }
-    }
-    return GuardianDecision(message: _cleanResponse(response));
-  }
-
-  String _cleanResponse(String response) {
-    final cleaned = response
-        .trim()
-        .split('\n')
-        .where((line) {
-          final trimmed = line.trim();
-          return !(trimmed.startsWith('{') && trimmed.contains('"decision"'));
-        })
-        .join('\n')
-        .trim();
-    return cleaned.isEmpty ? 'no.' : cleaned;
-  }
 
   bool _isExplicitDenial(String response) {
     final lower = response.toLowerCase();
