@@ -13,6 +13,10 @@ class WindowsLockdown {
 
   static bool get isLocked => _isLocked;
 
+  static File get _lockFlagFile => File(
+        '${Directory.systemTemp.path}${Platform.pathSeparator}sleep_time.locked',
+      );
+
   /// Best-effort cleanup for cases where the app previously crashed while the
   /// machine was locked down.
   static Future<void> restoreSystemState() async {
@@ -21,6 +25,7 @@ class WindowsLockdown {
     _isLocked = false;
     _refocusTimer?.cancel();
     _refocusTimer = null;
+    await _writeLockFlag(false);
 
     await _setRegistryDword(
       r'HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\System',
@@ -68,6 +73,7 @@ class WindowsLockdown {
     if (!Platform.isWindows || _isLocked) return;
 
     _isLocked = true;
+    await _writeLockFlag(true);
 
     await windowManager.show();
     await windowManager.focus();
@@ -102,7 +108,7 @@ class WindowsLockdown {
       1,
     );
 
-    // Only kill explorer in release mode — debug/profile need it for DevTools
+    // Only kill explorer in release mode — debug/profile need it for DevTools.
     if (kReleaseMode) {
       await _killExplorer();
     }
@@ -128,6 +134,7 @@ class WindowsLockdown {
     _isLocked = false;
     _refocusTimer?.cancel();
     _refocusTimer = null;
+    await _writeLockFlag(false);
 
     try {
       await windowManager.setFullScreen(false);
@@ -147,6 +154,7 @@ class WindowsLockdown {
 
     _refocusTimer?.cancel();
     _refocusTimer = null;
+    await _writeLockFlag(false);
 
     try {
       await windowManager.setFullScreen(false);
@@ -165,6 +173,18 @@ class WindowsLockdown {
     if (!Platform.isWindows) return;
     _isLocked = false;
     await activate();
+  }
+
+  static Future<void> _writeLockFlag(bool locked) async {
+    try {
+      if (locked) {
+        await _lockFlagFile.writeAsString('locked');
+      } else if (await _lockFlagFile.exists()) {
+        await _lockFlagFile.delete();
+      }
+    } catch (_) {
+      // Fail open rather than risking a machine that stays stuck.
+    }
   }
 
   static Future<void> _setRegistryDword(
@@ -197,7 +217,10 @@ class WindowsLockdown {
 
   static Future<bool> _isExplorerRunning() async {
     try {
-      final result = await Process.run('tasklist', ['/fi', 'imagename eq explorer.exe']);
+      final result = await Process.run('tasklist', [
+        '/fi',
+        'imagename eq explorer.exe',
+      ]);
       final output = '${result.stdout} ${result.stderr}'.toLowerCase();
       return output.contains('explorer.exe');
     } catch (_) {

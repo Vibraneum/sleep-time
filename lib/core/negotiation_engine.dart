@@ -82,7 +82,7 @@ class NegotiationEngine {
         apiKey: AppConfig.activeApiKey,
         generationConfig: GenerationConfig(
           temperature: 0.7,
-          maxOutputTokens: 300,
+          maxOutputTokens: 500,
         ),
       );
     }
@@ -100,8 +100,12 @@ class NegotiationEngine {
 
     final memoryContext = await MemoryService.buildNegotiationContext();
     final now = DateTime.now();
-    final time =
-        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    final currentLocalTime = AppConfig.formatDateTimeWithZone(now);
+    final runtimeMode = AppConfig.simulateLockdown
+        ? 'manual lockdown test mode'
+        : AppConfig.isLockdownTime(now)
+            ? 'real lockdown'
+            : 'manual chat opened outside lockdown schedule';
 
     _systemPrompt = '''
 $_personalityPrompt
@@ -112,7 +116,9 @@ $memoryContext
 
 ---
 
-current time: $time
+CURRENT LOCAL WALL CLOCK: $currentLocalTime
+IMPORTANT: treat the local wall clock above as authoritative. if it says PM, do not call it AM. if it says evening, do not pretend it is morning.
+current mode: $runtimeMode
 active provider: ${AppConfig.providerLabel}
 active model: ${AppConfig.activeModel}
 lockdown window: ${AppConfig.formatTime(AppConfig.lockdownHour, AppConfig.lockdownMinute)} - ${AppConfig.formatTime(AppConfig.unlockHour, AppConfig.unlockMinute)}
@@ -120,7 +126,8 @@ grants used tonight: ${await MemoryService.getTonightGrantCount()}
 
 ${AppConfig.agentAutonomyNote}
 
-The user just opened the negotiation screen during lockdown. Stay in character. Keep answers short. When making a final grant/deny/lock decision, put the JSON decision object on the last line.
+Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.
+When making a final grant/deny/lock decision, put the JSON decision object on the last line.
 ''';
 
     if (AppConfig.aiProvider == AiProvider.gemini) {
@@ -134,6 +141,14 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
   }
 
   Future<GuardianDecision> negotiate(String userMessage) async {
+    if (kDebugMode && userMessage.trim().toLowerCase() == 'solara') {
+      return GuardianDecision(
+        message: 'fine. one minute. test it and leave.',
+        granted: true,
+        minutesGranted: 1,
+      );
+    }
+
     if (_sessionId.isEmpty) {
       await startSession();
     }
@@ -197,7 +212,7 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
       },
       body: jsonEncode({
         'model': AppConfig.anthropicModel,
-        'max_tokens': 300,
+        'max_tokens': 500,
         'temperature': 0.7,
         'system': _systemPrompt,
         'messages': _anthropicMessages,
@@ -205,7 +220,9 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
     );
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('Anthropic request failed: ${response.statusCode} ${response.body}');
+      throw Exception(
+        'Anthropic request failed: ${response.statusCode} ${response.body}',
+      );
     }
 
     final json = jsonDecode(response.body) as Map<String, dynamic>;
@@ -222,7 +239,6 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
     return reply;
   }
 
-
   bool _isExplicitDenial(String response) {
     final lower = response.toLowerCase();
     return lower.contains('"decision": "deny"') ||
@@ -233,7 +249,8 @@ The user just opened the negotiation screen during lockdown. Stay in character. 
   String _missingKeyMessage() {
     switch (AppConfig.aiProvider) {
       case AiProvider.gemini:
-        if (!AppConfig.useBringYourOwnKey && AppConfig.conciergeGeminiApiKey.isEmpty) {
+        if (!AppConfig.useBringYourOwnKey &&
+            AppConfig.conciergeGeminiApiKey.isEmpty) {
           return 'no concierge gemini key is configured yet. add one in the app build or switch to byok.';
         }
         return 'set your gemini api key in settings or disable byok.';

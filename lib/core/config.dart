@@ -135,4 +135,16 @@ class AppConfig {
     final h12 = h % 12 == 0 ? 12 : h % 12;
     return '$h12:${minute.toString().padLeft(2, '0')} $period';
   }
+
+  static String formatDateTimeWithZone(DateTime time) {
+    final date =
+        '${time.year.toString().padLeft(4, '0')}-${time.month.toString().padLeft(2, '0')}-${time.day.toString().padLeft(2, '0')}';
+    final clock = formatTime(time.hour, time.minute);
+    final offset = time.timeZoneOffset;
+    final sign = offset.isNegative ? '-' : '+';
+    final absOffset = offset.abs();
+    final offsetText =
+        '$sign${absOffset.inHours.toString().padLeft(2, '0')}:${(absOffset.inMinutes % 60).toString().padLeft(2, '0')}';
+    return '$date $clock ${time.timeZoneName} (UTC$offsetText)';
+  }
 }
