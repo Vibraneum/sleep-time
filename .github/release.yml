@@ -1,0 +1,45 @@
+name-template: 'v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+change-template: '- $TITLE (#$NUMBER)'
+categories:
+  - title: '🚀 Features'
+    labels:
+      - feature
+      - enhancement
+  - title: '🐛 Fixes'
+    labels:
+      - fix
+      - bug
+  - title: '🧰 Maintenance'
+    labels:
+      - chore
+      - ci
+      - docs
+      - refactor
+change-title-escapes: '\<*_&'
+version-resolver:
+  major:
+    labels:
+      - breaking
+  minor:
+    labels:
+      - feature
+      - enhancement
+  patch:
+    labels:
+      - fix
+      - bug
+      - chore
+      - ci
+      - docs
+      - refactor
+  default: patch
+template: |
+  ## What's changed
+
+  $CHANGES
+
+  ## Notes
+
+  - See README.md for setup and platform limitations.
+  - Tagging `vX.Y.Z` will publish a GitHub Release and attach Windows artifacts.
