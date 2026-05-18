@@ -2,6 +2,8 @@
 
 A cross-platform sleep enforcement app that locks your device at bedtime, with an AI guardian you must negotiate with to get screen time back.
 
+> **New machine? Read [KICKOFF.md](KICKOFF.md) first** — it lists the required toolchain (Flutter, adb, gstack, VS C++ workload), what to avoid (the failed VirtualBox-on-Win11-Home path from 2026-05-17), and the order to bring a fresh laptop online. Past-session notes live in [docs/SESSION_NOTES_2026-05-17.md](docs/SESSION_NOTES_2026-05-17.md).
+
 ## Architecture
 
 - **Flutter** — cross-platform (Windows desktop + Android APK)

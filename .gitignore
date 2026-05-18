@@ -47,3 +47,9 @@ app.*.map.json
 # Env / secrets
 .env
 .env.*
+
+# OMC runtime state (per-machine, never commit)
+.omc/
+
+# Built release zips — rebuild via `flutter build` instead of committing binaries
+/dist/
