@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:sqflite/sqflite.dart';
 // ignore: depend_on_referenced_packages
 import 'package:path/path.dart' as p;
@@ -117,9 +119,37 @@ class ConversationMessage {
 class MemoryService {
   static Database? _db;
 
+  static Future<Database?> get _safeDb async {
+    try {
+      return await database;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Returns the app data directory, creating it if needed.
+  /// Windows: %APPDATA%/SleepTime/
+  /// Linux/macOS: ~/.config/SleepTime/
+  /// Fallback: sqflite default
+  static Future<String> get appDataPath async {
+    String base;
+    if (Platform.isWindows) {
+      base = Platform.environment['APPDATA'] ?? '';
+    } else if (Platform.isMacOS || Platform.isLinux) {
+      base = Platform.environment['HOME'] ?? '';
+      base = p.join(base, '.config');
+    } else {
+      return getDatabasesPath();
+    }
+    if (base.isEmpty) return getDatabasesPath();
+    final dir = Directory(p.join(base, 'SleepTime'));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir.path;
+  }
+
   static Future<Database> get database async {
     if (_db != null) return _db!;
-    final dbPath = await getDatabasesPath();
+    final dbPath = await appDataPath;
     _db = await openDatabase(
       p.join(dbPath, 'sleep_guardian.db'),
       version: 1,
@@ -173,95 +203,91 @@ class MemoryService {
   // --- Memories ---
 
   static Future<void> saveMemory(MemoryItem item) async {
-    final db = await database;
-    await db.insert('memories', item.toMap());
+    final db = await _safeDb;
+    if (db == null) return;
+    try { await db.insert('memories', item.toMap()); } catch (_) {}
   }
 
   static Future<List<MemoryItem>> getMemories({
     MemoryType? type,
     int limit = 20,
   }) async {
-    final db = await database;
-    final where = type != null ? 'type = ?' : null;
-    final whereArgs = type != null ? [type.name] : null;
-    final rows = await db.query(
-      'memories',
-      where: where,
-      whereArgs: whereArgs,
-      orderBy: 'created_at DESC',
-      limit: limit,
-    );
-    return rows.map(MemoryItem.fromMap).toList();
+    final db = await _safeDb;
+    if (db == null) return [];
+    try {
+      final where = type != null ? 'type = ?' : null;
+      final whereArgs = type != null ? [type.name] : null;
+      final rows = await db.query('memories',
+          where: where, whereArgs: whereArgs, orderBy: 'created_at DESC', limit: limit);
+      return rows.map(MemoryItem.fromMap).toList();
+    } catch (_) { return []; }
   }
 
   static Future<List<MemoryItem>> getActiveMemories() async {
-    final db = await database;
-    final now = DateTime.now().toIso8601String();
-    final rows = await db.query(
-      'memories',
-      where: 'expires_at IS NULL OR expires_at > ?',
-      whereArgs: [now],
-      orderBy: 'created_at DESC',
-      limit: 50,
-    );
-    return rows.map(MemoryItem.fromMap).toList();
+    final db = await _safeDb;
+    if (db == null) return [];
+    try {
+      final now = DateTime.now().toIso8601String();
+      final rows = await db.query('memories',
+          where: 'expires_at IS NULL OR expires_at > ?',
+          whereArgs: [now], orderBy: 'created_at DESC', limit: 50);
+      return rows.map(MemoryItem.fromMap).toList();
+    } catch (_) { return []; }
   }
 
   // --- Negotiations ---
 
   static Future<void> saveNegotiation(NegotiationRecord record) async {
-    final db = await database;
-    await db.insert('negotiations', record.toMap());
+    final db = await _safeDb;
+    if (db == null) return;
+    try { await db.insert('negotiations', record.toMap()); } catch (_) {}
   }
 
   static Future<List<NegotiationRecord>> getRecentNegotiations({
     int days = 7,
     int limit = 20,
   }) async {
-    final db = await database;
-    final since =
-        DateTime.now().subtract(Duration(days: days)).toIso8601String();
-    final rows = await db.query(
-      'negotiations',
-      where: 'timestamp > ?',
-      whereArgs: [since],
-      orderBy: 'timestamp DESC',
-      limit: limit,
-    );
-    return rows.map(NegotiationRecord.fromMap).toList();
+    final db = await _safeDb;
+    if (db == null) return [];
+    try {
+      final since = DateTime.now().subtract(Duration(days: days)).toIso8601String();
+      final rows = await db.query('negotiations',
+          where: 'timestamp > ?', whereArgs: [since],
+          orderBy: 'timestamp DESC', limit: limit);
+      return rows.map(NegotiationRecord.fromMap).toList();
+    } catch (_) { return []; }
   }
 
   static Future<int> getTonightGrantCount() async {
-    final db = await database;
-    final tonight = DateTime.now().copyWith(hour: 22, minute: 0, second: 0);
-    final rows = await db.query(
-      'negotiations',
-      where: 'timestamp > ? AND granted = 1',
-      whereArgs: [tonight.toIso8601String()],
-    );
-    return rows.length;
+    final db = await _safeDb;
+    if (db == null) return 0;
+    try {
+      final tonight = DateTime.now().copyWith(hour: 22, minute: 0, second: 0);
+      final rows = await db.query('negotiations',
+          where: 'timestamp > ? AND granted = 1',
+          whereArgs: [tonight.toIso8601String()]);
+      return rows.length;
+    } catch (_) { return 0; }
   }
 
   // --- Conversations ---
 
   static Future<void> saveMessage(ConversationMessage msg) async {
-    final db = await database;
-    await db.insert('conversations', msg.toMap());
+    final db = await _safeDb;
+    if (db == null) return;
+    try { await db.insert('conversations', msg.toMap()); } catch (_) {}
   }
 
   static Future<List<ConversationMessage>> getSessionMessages(
-    String sessionId, {
-    int limit = 50,
-  }) async {
-    final db = await database;
-    final rows = await db.query(
-      'conversations',
-      where: 'session_id = ?',
-      whereArgs: [sessionId],
-      orderBy: 'timestamp ASC',
-      limit: limit,
-    );
-    return rows.map(ConversationMessage.fromMap).toList();
+    String sessionId, {int limit = 50}) async {
+    final db = await _safeDb;
+    if (db == null) return [];
+    try {
+      final rows = await db.query('conversations',
+          where: 'session_id = ?', whereArgs: [sessionId],
+          orderBy: 'timestamp ASC', limit: limit);
+      return rows.map(ConversationMessage.fromMap).toList();
+    } catch (_) { return []; }
   }
 
   // --- Sleep Log ---
@@ -272,50 +298,44 @@ class MemoryService {
     int grantsUsed = 0,
     int totalExtraMinutes = 0,
   }) async {
-    final db = await database;
-    final date = lockdownStart.toIso8601String().split('T')[0];
-    final existing = await db.query(
-      'sleep_log',
-      columns: ['id'],
-      where: 'date = ?',
-      whereArgs: [date],
-      limit: 1,
-    );
-    if (existing.isNotEmpty) return;
-
-    final compliance = grantsUsed == 0 ? 1.0 : (1.0 - (grantsUsed * 0.2));
-    await db.insert('sleep_log', {
-      'date': date,
-      'lockdown_start': lockdownStart.toIso8601String(),
-      'actual_sleep': actualSleep?.toIso8601String(),
-      'grants_used': grantsUsed,
-      'total_extra_minutes': totalExtraMinutes,
-      'compliance_score': compliance.clamp(0.0, 1.0),
-    });
+    final db = await _safeDb;
+    if (db == null) return;
+    try {
+      final date = lockdownStart.toIso8601String().split('T')[0];
+      final existing = await db.query('sleep_log',
+          columns: ['id'], where: 'date = ?', whereArgs: [date], limit: 1);
+      if (existing.isNotEmpty) return;
+      final compliance = grantsUsed == 0 ? 1.0 : (1.0 - (grantsUsed * 0.2));
+      await db.insert('sleep_log', {
+        'date': date,
+        'lockdown_start': lockdownStart.toIso8601String(),
+        'actual_sleep': actualSleep?.toIso8601String(),
+        'grants_used': grantsUsed,
+        'total_extra_minutes': totalExtraMinutes,
+        'compliance_score': compliance.clamp(0.0, 1.0),
+      });
+    } catch (_) {}
   }
 
-  static Future<List<Map<String, dynamic>>> getRecentSleepLog({
-    int days = 14,
-  }) async {
-    final db = await database;
-    final since =
-        DateTime.now().subtract(Duration(days: days)).toIso8601String();
-    return db.query(
-      'sleep_log',
-      where: 'date > ?',
-      whereArgs: [since.split('T')[0]],
-      orderBy: 'date DESC',
-    );
+  static Future<List<Map<String, dynamic>>> getRecentSleepLog({int days = 14}) async {
+    final db = await _safeDb;
+    if (db == null) return [];
+    try {
+      final since = DateTime.now().subtract(Duration(days: days)).toIso8601String();
+      return db.query('sleep_log',
+          where: 'date > ?', whereArgs: [since.split('T')[0]],
+          orderBy: 'date DESC');
+    } catch (_) { return []; }
   }
 
   static Future<double> getComplianceRate({int days = 7}) async {
-    final logs = await getRecentSleepLog(days: days);
-    if (logs.isEmpty) return 1.0;
-    final total = logs.fold<double>(
-      0.0,
-      (sum, log) => sum + (log['compliance_score'] as double? ?? 1.0),
-    );
-    return total / logs.length;
+    try {
+      final logs = await getRecentSleepLog(days: days);
+      if (logs.isEmpty) return 1.0;
+      final total = logs.fold<double>(
+          0.0, (sum, log) => sum + (log['compliance_score'] as double? ?? 1.0));
+      return total / logs.length;
+    } catch (_) { return 1.0; }
   }
 
   /// Build a context string for the LLM about the user's negotiation history.

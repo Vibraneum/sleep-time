@@ -35,11 +35,6 @@ class _HomeScreenState extends State<HomeScreen> {
       },
     );
     _scheduler.start();
-    if (AppConfig.simulateLockdown) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        if (mounted) _showLockdownScreen();
-      });
-    }
   }
 
   void _onStateChange(LockdownState state) {

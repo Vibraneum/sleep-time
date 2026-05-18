@@ -34,5 +34,13 @@ void main() {
       expect(AppConfig.sanitizeGrantedMinutes(5), 5);
       expect(AppConfig.sanitizeGrantedMinutes(999), 120);
     });
+
+    test('simulateLockdown defaults to true in debug builds', () {
+      // Tests run under `flutter test` in debug, so the default initializer
+      // should evaluate to true. This guards against accidentally flipping
+      // the default and ambushing developers with a real lockdown next time
+      // they `flutter run`.
+      expect(AppConfig.simulateLockdown, isTrue);
+    });
   });
 }

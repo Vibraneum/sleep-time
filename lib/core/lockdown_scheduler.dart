@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'config.dart';
 import 'memory_service.dart';
-import 'poke_service.dart';
 
 enum LockdownState {
   inactive,
@@ -22,6 +21,7 @@ class LockdownScheduler {
   int _grantedMinutesTonight = 0;
   bool _windDownNotified = false;
   bool _lockdownNotified = false;
+  bool _permanentlyUnlocked = false;
   String? _lastSleepLogDate;
 
   final void Function(LockdownState state) onStateChange;
@@ -68,12 +68,10 @@ class LockdownScheduler {
 
     if (newState == LockdownState.windDown && !_windDownNotified) {
       _windDownNotified = true;
-      unawaited(PokeService.sendBedtimeWarning());
     }
 
     if (newState == LockdownState.locked && !_lockdownNotified) {
       _lockdownNotified = true;
-      unawaited(PokeService.sendLockdownActive());
     }
 
     if ((previousState == LockdownState.locked ||
@@ -99,10 +97,25 @@ class LockdownScheduler {
       _grantTimer?.cancel();
     }
 
+    if (_permanentlyUnlocked) {
+      // Reset the flag once we're naturally outside lockdown hours.
+      if (!AppConfig.isLockdownTime(now)) _permanentlyUnlocked = false;
+      return LockdownState.unlocked;
+    }
+
     if (AppConfig.isLockdownTime(now)) return LockdownState.locked;
     if (AppConfig.isWindDownTime(now)) return LockdownState.windDown;
     if (AppConfig.isAwakeTime(now)) return LockdownState.awake;
     return LockdownState.unlocked;
+  }
+
+  /// Fully unlock for the rest of the night — no timer, no re-lock.
+  void fullUnlock() {
+    _grantTimer?.cancel();
+    _grantExpiry = null;
+    _permanentlyUnlocked = true;
+    _state = LockdownState.unlocked;
+    onStateChange(_state);
   }
 
   void grantExtension(int minutes) {
@@ -112,7 +125,6 @@ class LockdownScheduler {
     _grantExpiry = DateTime.now().add(Duration(minutes: safeMinutes));
     _state = LockdownState.granted;
     onStateChange(_state);
-    unawaited(PokeService.sendGrantNotification(safeMinutes));
 
     _grantTimer?.cancel();
     _grantTimer = Timer.periodic(const Duration(seconds: 1), (_) {

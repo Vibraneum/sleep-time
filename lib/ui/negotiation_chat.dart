@@ -1,16 +1,23 @@
 import 'package:flutter/material.dart';
+import '../core/config.dart';
 import '../core/negotiation_engine.dart';
 
 class NegotiationChat extends StatefulWidget {
   final NegotiationEngine engine;
   final int grantsUsedTonight;
   final void Function(int minutes) onGranted;
+  final void Function()? onMinimize;
+  final void Function()? onClose;
+  final void Function()? onUnlock;
 
   const NegotiationChat({
     super.key,
     required this.engine,
     required this.grantsUsedTonight,
     required this.onGranted,
+    this.onMinimize,
+    this.onClose,
+    this.onUnlock,
   });
 
   @override
@@ -67,6 +74,24 @@ class _NegotiationChatState extends State<NegotiationChat> {
     final text = _controller.text.trim();
     if (text.isEmpty || _isLoading || _negotiationOver) return;
 
+    // Safe word check — shut the app down completely
+    if (AppConfig.safeWord.isNotEmpty &&
+        text.toLowerCase() == AppConfig.safeWord.toLowerCase()) {
+      _controller.clear();
+      setState(() {
+        _messages.add(_ChatMessage(text: text, isUser: true));
+        _messages.add(_ChatMessage(
+          text: 'safe word accepted. shutting down.',
+          isUser: false,
+        ));
+        _negotiationOver = true;
+      });
+      _scrollToBottom();
+      await Future.delayed(const Duration(seconds: 1));
+      widget.onClose?.call();
+      return;
+    }
+
     _controller.clear();
     setState(() {
       _messages.add(_ChatMessage(text: text, isUser: true));
@@ -81,10 +106,22 @@ class _NegotiationChatState extends State<NegotiationChat> {
         _isLoading = false;
       });
 
-      if (decision.granted) {
+      if (decision.action != GuardianAction.none &&
+          decision.action != GuardianAction.deny) {
         _negotiationOver = true;
         await Future.delayed(const Duration(seconds: 2));
-        widget.onGranted(decision.minutesGranted);
+        switch (decision.action) {
+          case GuardianAction.grant:
+            widget.onGranted(decision.minutesGranted);
+          case GuardianAction.minimize:
+            widget.onMinimize?.call();
+          case GuardianAction.close:
+            widget.onClose?.call();
+          case GuardianAction.unlock:
+            widget.onUnlock?.call();
+          default:
+            break;
+        }
       }
     } catch (e) {
       setState(() {

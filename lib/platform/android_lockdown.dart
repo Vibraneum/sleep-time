@@ -1,5 +1,8 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+
+import '../core/config.dart';
 
 /// Android-specific lockdown using platform channels.
 /// The native Kotlin side handles Device Admin and kiosk mode.
@@ -8,6 +11,8 @@ class AndroidLockdown {
   static bool _isLocked = false;
 
   static bool get isLocked => _isLocked;
+
+  static bool get _simulating => AppConfig.simulateLockdown;
 
   /// Request Device Admin permission (must be done once during setup).
   static Future<bool> requestDeviceAdmin() async {
@@ -32,13 +37,20 @@ class AndroidLockdown {
   /// Activate full lockdown: lock screen, start kiosk mode.
   static Future<void> activate() async {
     if (!Platform.isAndroid || _isLocked) return;
+    if (_simulating) {
+      if (kDebugMode) debugPrint('[sleep-time] simulate: android lockdown ON');
+      _isLocked = true;
+      return;
+    }
     _isLocked = true;
 
     try {
       await _channel.invokeMethod('activateLockdown');
     } catch (_) {
       // Fallback: at minimum start screen pinning
-      await _channel.invokeMethod('startScreenPinning');
+      try {
+        await _channel.invokeMethod('startScreenPinning');
+      } catch (_) {}
     }
   }
 
@@ -46,6 +58,10 @@ class AndroidLockdown {
   static Future<void> deactivate() async {
     if (!Platform.isAndroid || !_isLocked) return;
     _isLocked = false;
+    if (_simulating) {
+      if (kDebugMode) debugPrint('[sleep-time] simulate: android lockdown OFF');
+      return;
+    }
 
     try {
       await _channel.invokeMethod('deactivateLockdown');
@@ -55,6 +71,10 @@ class AndroidLockdown {
   /// Grant temporary extension — exit kiosk but keep app running.
   static Future<void> grantExtension() async {
     if (!Platform.isAndroid) return;
+    if (_simulating) {
+      if (kDebugMode) debugPrint('[sleep-time] simulate: android grant');
+      return;
+    }
     try {
       await _channel.invokeMethod('grantExtension');
     } catch (_) {}

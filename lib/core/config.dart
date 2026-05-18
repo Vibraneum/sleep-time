@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 enum AiProvider { gemini, anthropic }
 
 /// App configuration — schedule, providers, keys, and state helpers.
@@ -8,9 +10,25 @@ class AppConfig {
   static String pokeApiKey = '';
   static AiProvider aiProvider = AiProvider.gemini;
   static bool useBringYourOwnKey = false;
-  static String geminiModel = 'gemini-3-flash-preview';
+  static String geminiModel = 'gemini-2.5-flash';
   static String anthropicModel = 'claude-haiku-4-5-20251001';
-  static bool simulateLockdown = false;
+  static String safeWord = 'dontdie';
+
+  /// Off by default. The previous default of `true` silently registered the
+  /// app to launch with Windows the first time it ran — invasive for anyone
+  /// just trying the app out. Users can opt in from Settings.
+  static bool runAtStartup = false;
+
+  /// When true, all platform lockdown side effects (full-screen, always-on-top,
+  /// refocus loops, registry writes, Android device-admin / kiosk calls) are
+  /// short-circuited. The UI still simulates the locked / granted / unlocked
+  /// states so you can exercise the flow safely.
+  ///
+  /// Defaults to `true` in debug builds so running `flutter run` on your dev
+  /// machine cannot accidentally lock you out. Release builds default to
+  /// `false`. Both can be overridden by the user (Settings) or at compile
+  /// time via `--dart-define=SIMULATE_LOCKDOWN=true|false`.
+  static bool simulateLockdown = kDebugMode;
 
   // Schedule — all configurable
   static int wakeUpHour = 22; // 10:30 PM — guardian wakes up
@@ -81,7 +99,6 @@ class AppConfig {
   }
 
   static bool isLockdownTime([DateTime? now]) {
-    if (simulateLockdown) return true;
     final time = now ?? DateTime.now();
     return _isWithinWindow(
       startMinutes: _minutesOfDay(lockdownHour, lockdownMinute),

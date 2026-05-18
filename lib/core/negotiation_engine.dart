@@ -8,16 +8,20 @@ import 'package:http/http.dart' as http;
 import 'config.dart';
 import 'memory_service.dart';
 
+enum GuardianAction { none, grant, deny, minimize, close, unlock }
+
 class GuardianDecision {
   final String message;
-  final bool granted;
+  final GuardianAction action;
   final int minutesGranted;
 
   GuardianDecision({
     required this.message,
-    this.granted = false,
+    this.action = GuardianAction.none,
     this.minutesGranted = 0,
   });
+
+  bool get granted => action == GuardianAction.grant;
 }
 
 @visibleForTesting
@@ -34,12 +38,33 @@ GuardianDecision parseGuardianDecision(String response) {
         );
         return GuardianDecision(
           message: cleanGuardianResponse(response),
-          granted: true,
+          action: GuardianAction.grant,
           minutesGranted: minutes,
         );
       }
       if (decision == 'deny' || decision == 'lock') {
-        return GuardianDecision(message: cleanGuardianResponse(response));
+        return GuardianDecision(
+          message: cleanGuardianResponse(response),
+          action: GuardianAction.deny,
+        );
+      }
+      if (decision == 'minimize') {
+        return GuardianDecision(
+          message: cleanGuardianResponse(response),
+          action: GuardianAction.minimize,
+        );
+      }
+      if (decision == 'close' || decision == 'exit') {
+        return GuardianDecision(
+          message: cleanGuardianResponse(response),
+          action: GuardianAction.close,
+        );
+      }
+      if (decision == 'unlock') {
+        return GuardianDecision(
+          message: cleanGuardianResponse(response),
+          action: GuardianAction.unlock,
+        );
       }
     } catch (_) {
       continue;
@@ -101,11 +126,9 @@ class NegotiationEngine {
     final memoryContext = await MemoryService.buildNegotiationContext();
     final now = DateTime.now();
     final currentLocalTime = AppConfig.formatDateTimeWithZone(now);
-    final runtimeMode = AppConfig.simulateLockdown
-        ? 'manual lockdown test mode'
-        : AppConfig.isLockdownTime(now)
-            ? 'real lockdown'
-            : 'manual chat opened outside lockdown schedule';
+    final runtimeMode = AppConfig.isLockdownTime(now)
+        ? 'real lockdown'
+        : 'manual chat opened outside lockdown schedule';
 
     _systemPrompt = '''
 $_personalityPrompt
@@ -130,11 +153,15 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.
 When making a final grant/deny/lock decision, put the JSON decision object on the last line.
 ''';
 
-    if (AppConfig.aiProvider == AiProvider.gemini) {
+    if (AppConfig.aiProvider == AiProvider.gemini && _geminiModel != null) {
       _geminiChat = _geminiModel!.startChat();
-      await _geminiChat!.sendMessage(Content.text(
-        'SYSTEM CONTEXT (not from user):\n$_systemPrompt\n\nRespond with your opening line.',
-      ));
+      try {
+        await _geminiChat!.sendMessage(Content.text(
+          'SYSTEM CONTEXT (not from user):\n$_systemPrompt\n\nRespond with your opening line.',
+        ));
+      } catch (_) {
+        _geminiChat = null;
+      }
     }
 
     return _sessionId;
@@ -144,7 +171,7 @@ When making a final grant/deny/lock decision, put the JSON decision object on th
     if (kDebugMode && userMessage.trim().toLowerCase() == 'solara') {
       return GuardianDecision(
         message: 'fine. one minute. test it and leave.',
-        granted: true,
+        action: GuardianAction.grant,
         minutesGranted: 1,
       );
     }
@@ -164,22 +191,21 @@ When making a final grant/deny/lock decision, put the JSON decision object on th
     ));
 
     final responseText = await _sendToProvider(userMessage);
-    final cleanMessage = cleanGuardianResponse(responseText);
     final parsed = parseGuardianDecision(responseText);
 
     await MemoryService.saveMessage(ConversationMessage(
       role: 'guardian',
-      content: cleanMessage,
+      content: parsed.message,
       sessionId: _sessionId,
     ));
 
-    if (parsed.granted || _isExplicitDenial(responseText)) {
+    if (parsed.action != GuardianAction.none) {
       final tonightGrantCount = await MemoryService.getTonightGrantCount();
       await MemoryService.saveNegotiation(NegotiationRecord(
         userReason: userMessage,
         granted: parsed.granted,
         minutesGranted: parsed.minutesGranted,
-        guardianResponse: cleanMessage,
+        guardianResponse: parsed.message,
         grantNumber: parsed.granted ? tonightGrantCount + 1 : tonightGrantCount,
       ));
     }
@@ -190,10 +216,11 @@ When making a final grant/deny/lock decision, put the JSON decision object on th
   Future<String> _sendToProvider(String userMessage) async {
     switch (AppConfig.aiProvider) {
       case AiProvider.gemini:
-        if (_geminiChat == null) {
-          await startSession();
-        }
-        final response = await _geminiChat!.sendMessage(Content.text(userMessage));
+        if (_geminiChat == null) await startSession();
+        if (_geminiChat == null) return 'guardian is offline. try again.';
+        final response = await _geminiChat!
+            .sendMessage(Content.text(userMessage))
+            .timeout(const Duration(seconds: 30));
         return response.text ?? 'no.';
       case AiProvider.anthropic:
         return _sendAnthropic(userMessage);
@@ -217,7 +244,7 @@ When making a final grant/deny/lock decision, put the JSON decision object on th
         'system': _systemPrompt,
         'messages': _anthropicMessages,
       }),
-    );
+    ).timeout(const Duration(seconds: 30));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
@@ -237,13 +264,6 @@ When making a final grant/deny/lock decision, put the JSON decision object on th
     final reply = text.isEmpty ? 'no.' : text;
     _anthropicMessages.add({'role': 'assistant', 'content': reply});
     return reply;
-  }
-
-  bool _isExplicitDenial(String response) {
-    final lower = response.toLowerCase();
-    return lower.contains('"decision": "deny"') ||
-        lower.contains('"decision": "lock"') ||
-        lower == 'no.';
   }
 
   String _missingKeyMessage() {

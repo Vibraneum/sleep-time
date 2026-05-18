@@ -6,7 +6,10 @@ import 'package:window_manager/window_manager.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/negotiation_engine.dart';
 import '../core/config.dart';
+import '../platform/windows_lockdown.dart';
 import 'negotiation_chat.dart';
+import 'home_screen.dart';
+import 'settings_screen.dart';
 
 class LockdownScreen extends StatefulWidget {
   final LockdownScheduler scheduler;
@@ -54,13 +57,79 @@ class _LockdownScreenState extends State<LockdownScreen>
     setState(() => _showChat = false);
   }
 
+  Future<void> _onMinimize() async {
+    widget.scheduler.grantExtension(30);
+    await WindowsLockdown.deactivate();
+    if (Platform.isWindows && !AppConfig.simulateLockdown) {
+      try {
+        await windowManager.minimize();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _onClose() async {
+    widget.scheduler.fullUnlock();
+    await WindowsLockdown.deactivate();
+    // In simulate mode (or on mobile) just return to the home screen instead
+    // of killing the process — closing makes no sense in dev / on Android.
+    if (AppConfig.simulateLockdown || !Platform.isWindows) {
+      if (mounted) {
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+          (_) => false,
+        );
+      }
+      return;
+    }
+    try {
+      await windowManager.setPreventClose(false);
+      await windowManager.destroy();
+    } catch (_) {
+      exit(0);
+    }
+  }
+
+  void _onUnlock() {
+    widget.scheduler.fullUnlock();
+    WindowsLockdown.deactivate();
+    if (mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (_) => false,
+      );
+    }
+  }
+
   @override
   Future<void> onWindowClose() async {
+    if (AppConfig.simulateLockdown) return;
     if (widget.scheduler.state == LockdownState.locked) {
       await windowManager.focus();
       return;
     }
     await windowManager.destroy();
+  }
+
+  @override
+  Future<void> onWindowBlur() async {
+    if (AppConfig.simulateLockdown) return;
+    if (!WindowsLockdown.isLocked) return;
+    await Future.delayed(const Duration(milliseconds: 50));
+    try {
+      await windowManager.show();
+      await windowManager.focus();
+      await windowManager.setAlwaysOnTop(true);
+    } catch (_) {}
+  }
+
+  @override
+  Future<void> onWindowMinimize() async {
+    if (AppConfig.simulateLockdown) return;
+    if (!WindowsLockdown.isLocked) return;
+    try {
+      await windowManager.restore();
+      await windowManager.focus();
+    } catch (_) {}
   }
 
   @override
@@ -93,11 +162,48 @@ class _LockdownScreenState extends State<LockdownScreen>
     return _buildLockedView();
   }
 
+  void _openSettings() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const SettingsScreen()),
+    );
+  }
+
   Widget _buildLockedView() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
+    return Stack(
+      children: [
+        if (AppConfig.simulateLockdown)
+          Positioned(
+            top: 16,
+            left: 0,
+            right: 0,
+            child: Center(
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFFF9500).withAlpha(40),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: const Color(0xFFFF9500).withAlpha(120),
+                  ),
+                ),
+                child: const Text(
+                  'SAFE MODE — simulated lockdown',
+                  style: TextStyle(
+                    color: Color(0xFFFF9500),
+                    fontSize: 11,
+                    letterSpacing: 1.2,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+            ),
+          ),
+        Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
           AnimatedBuilder(
             animation: _pulseController,
             builder: (context, child) => Opacity(
@@ -164,6 +270,20 @@ class _LockdownScreenState extends State<LockdownScreen>
           ),
         ],
       ),
+        ),
+        Positioned(
+          bottom: 24,
+          right: 24,
+          child: GestureDetector(
+            onTap: _openSettings,
+            child: Icon(
+              Icons.settings_rounded,
+              color: Colors.white.withAlpha(30),
+              size: 20,
+            ),
+          ),
+        ),
+      ],
     );
   }
 
@@ -218,6 +338,9 @@ class _LockdownScreenState extends State<LockdownScreen>
             engine: _engine,
             grantsUsedTonight: widget.scheduler.grantsUsedTonight,
             onGranted: _onGranted,
+            onMinimize: _onMinimize,
+            onClose: _onClose,
+            onUnlock: _onUnlock,
           ),
         ),
       ],

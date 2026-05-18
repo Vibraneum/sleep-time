@@ -1,8 +1,24 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- Android 14+ requires a typed foreground service permission. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Keep the screen on during lockdown so the device cannot drift to sleep
+         while the lockdown UI is active. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Android 13+ runtime notification permission, used for wind-down /
+         lockdown / extension reminders. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Allow a high-priority full-screen alert when lockdown engages. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- Required for the schedule to fire at exactly the configured wake /
+         wind-down / lockdown / unlock times on Android 12+. The app does not
+         use exact alarms today, but declaring intent here keeps the manifest
+         honest with where the scheduler is heading. -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <application
         android:label="sleep time"

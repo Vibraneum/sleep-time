@@ -1,11 +1,19 @@
+import 'dart:async';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart' show databaseFactory, databaseFactoryFfi, sqfliteFfiInit;
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
+import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
+
+/// Compile-time override for safe / simulate mode.
+/// Pass `--dart-define=SIMULATE_LOCKDOWN=true|false` to flip it.
+const String _simulateLockdownEnv =
+    String.fromEnvironment('SIMULATE_LOCKDOWN', defaultValue: '');
 
 bool _setupComplete = false;
 
@@ -36,14 +44,25 @@ Future<void> _loadConfig() async {
   }
 
   AppConfig.geminiModel =
-      prefs.getString('gemini_model') ?? 'gemini-3-flash-preview';
+      prefs.getString('gemini_model') ?? 'gemini-2.5-flash';
   AppConfig.anthropicModel =
       prefs.getString('anthropic_model') ?? 'claude-haiku-4-5-20251001';
 
-  AppConfig.simulateLockdown = const bool.fromEnvironment(
-    'SIMULATE_LOCKDOWN',
-    defaultValue: false,
-  );
+  AppConfig.safeWord = prefs.getString('safe_word') ?? 'dontdie';
+
+  // Resolution order for simulate-lockdown:
+  //   1. compile-time --dart-define=SIMULATE_LOCKDOWN=...
+  //   2. previously-saved user preference
+  //   3. debug builds default to ON, release builds default to OFF
+  final envSim = _simulateLockdownEnv.toLowerCase();
+  if (envSim == 'true' || envSim == '1') {
+    AppConfig.simulateLockdown = true;
+  } else if (envSim == 'false' || envSim == '0') {
+    AppConfig.simulateLockdown = false;
+  } else {
+    AppConfig.simulateLockdown =
+        prefs.getBool('simulate_lockdown') ?? kDebugMode;
+  }
 
   AppConfig.wakeUpHour = prefs.getInt('wakeup_hour') ?? 22;
   AppConfig.wakeUpMinute = prefs.getInt('wakeup_minute') ?? 30;
@@ -59,24 +78,50 @@ Future<void> _loadConfig() async {
     _setupComplete = true;
     await prefs.setBool('setup_complete', true);
   }
+
+  // Off by default — opt in from Settings to launch with Windows.
+  AppConfig.runAtStartup = prefs.getBool('run_at_startup') ?? false;
+  if (_setupComplete &&
+      AppConfig.runAtStartup &&
+      !AppConfig.simulateLockdown) {
+    unawaited(WindowsLockdown.registerStartup());
+  }
+}
+
+Future<void> _initWindowManager() async {
+  await windowManager.ensureInitialized();
+
+  const options = WindowOptions(
+    size: Size(420, 740),
+    minimumSize: Size(420, 680),
+    center: true,
+    title: 'Sleep Time',
+    skipTaskbar: false,
+  );
+
+  // waitUntilReadyToShow ensures the window exists before we touch it —
+  // critical when launched from the Windows startup registry where the
+  // compositor may not be fully ready.
+  await windowManager.waitUntilReadyToShow(options, () async {
+    await windowManager.show();
+    await windowManager.focus();
+  });
 }
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Initialize sqflite FFI for Windows/Linux desktop
   if (Platform.isWindows || Platform.isLinux) {
     sqfliteFfiInit();
     databaseFactory = databaseFactoryFfi;
   }
 
   if (Platform.isWindows) {
-    await windowManager.ensureInitialized();
-    await windowManager.setTitle('Sleep Time');
-    await windowManager.setMinimumSize(const Size(420, 680));
-    await windowManager.setSize(const Size(420, 740));
-    await windowManager.center();
+    await _initWindowManager();
   }
+
+  // Clean up any leftover lockdown state from a previous crash.
+  await WindowsLockdown.restoreSystemState();
 
   await _loadConfig();
   runApp(const SleepTimeApp());

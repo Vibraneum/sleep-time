@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/config.dart';
+import '../platform/windows_lockdown.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -16,9 +19,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _pokeKeyController = TextEditingController();
   final _geminiModelController = TextEditingController();
   final _anthropicModelController = TextEditingController();
+  final _safeWordController = TextEditingController();
 
   late AiProvider _provider;
   late bool _useBringYourOwnKey;
+  late bool _runAtStartup;
+  late bool _simulateLockdown;
   late TimeOfDay _wakeUpTime;
   late TimeOfDay _windDownTime;
   late TimeOfDay _lockdownTime;
@@ -30,6 +36,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     super.initState();
     _provider = AppConfig.aiProvider;
     _useBringYourOwnKey = AppConfig.useBringYourOwnKey;
+    _runAtStartup = AppConfig.runAtStartup;
+    _simulateLockdown = AppConfig.simulateLockdown;
     _wakeUpTime =
         TimeOfDay(hour: AppConfig.wakeUpHour, minute: AppConfig.wakeUpMinute);
     _windDownTime = TimeOfDay(
@@ -48,6 +56,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _pokeKeyController.text = AppConfig.pokeApiKey;
     _geminiModelController.text = AppConfig.geminiModel;
     _anthropicModelController.text = AppConfig.anthropicModel;
+    _safeWordController.text = AppConfig.safeWord;
   }
 
   Future<void> _save() async {
@@ -74,6 +83,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await prefs.setInt('lockdown_minute', _lockdownTime.minute);
     await prefs.setInt('unlock_hour', _unlockTime.hour);
     await prefs.setInt('unlock_minute', _unlockTime.minute);
+    await prefs.setString('safe_word', _safeWordController.text.trim());
+    await prefs.setBool('run_at_startup', _runAtStartup);
+    await prefs.setBool('simulate_lockdown', _simulateLockdown);
 
     AppConfig.aiProvider = _provider;
     AppConfig.useBringYourOwnKey = _useBringYourOwnKey;
@@ -94,6 +106,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
     AppConfig.lockdownMinute = _lockdownTime.minute;
     AppConfig.unlockHour = _unlockTime.hour;
     AppConfig.unlockMinute = _unlockTime.minute;
+    AppConfig.safeWord = _safeWordController.text.trim();
+    AppConfig.runAtStartup = _runAtStartup;
+    AppConfig.simulateLockdown = _simulateLockdown;
+    if (Platform.isWindows) {
+      if (_runAtStartup && !_simulateLockdown) {
+        await WindowsLockdown.registerStartup();
+      } else {
+        await WindowsLockdown.unregisterStartup();
+      }
+    }
 
     if (!mounted) return;
     setState(() => _saved = true);
@@ -128,6 +150,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _pokeKeyController.dispose();
     _geminiModelController.dispose();
     _anthropicModelController.dispose();
+    _safeWordController.dispose();
     super.dispose();
   }
 
@@ -217,8 +240,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ]),
             const SizedBox(height: 16),
             _card([
+              _sectionTitle('Safe Word'),
+              const SizedBox(height: 10),
+              const Text(
+                'Set a secret word that instantly unlocks the app during lockdown. '
+                'Give it to a family member so they can override the lockdown if needed. '
+                'Leave blank to disable.',
+                style: TextStyle(
+                  fontSize: 13,
+                  color: Color(0xFF8E8EA0),
+                  height: 1.5,
+                ),
+              ),
+              const SizedBox(height: 12),
+              _textField('Safe word', _safeWordController, obscure: true),
+            ]),
+            const SizedBox(height: 16),
+            _card([
               _sectionTitle('Platform + Notifications'),
               const SizedBox(height: 14),
+              SwitchListTile.adaptive(
+                value: _simulateLockdown,
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Safe mode (simulate lockdown)'),
+                subtitle: const Text(
+                  'Walk through the full lockdown UI without any platform side effects — '
+                  'no fullscreen takeover, no always-on-top, no Android kiosk. '
+                  'Recommended while developing or trying the app for the first time.',
+                ),
+                onChanged: (value) =>
+                    setState(() => _simulateLockdown = value),
+              ),
+              const SizedBox(height: 12),
+              if (Platform.isWindows)
+                SwitchListTile.adaptive(
+                  value: _runAtStartup,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Launch at login'),
+                  subtitle: Text(
+                    _simulateLockdown
+                        ? 'Disabled while safe mode is on.'
+                        : 'Start Sleep Time automatically when you log into Windows.',
+                  ),
+                  onChanged: _simulateLockdown
+                      ? null
+                      : (value) => setState(() => _runAtStartup = value),
+                ),
+              if (Platform.isWindows) const SizedBox(height: 12),
               _textField('Poke API Key', _pokeKeyController, obscure: true),
               const SizedBox(height: 10),
               const Text(
