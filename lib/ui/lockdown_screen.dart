@@ -12,7 +12,6 @@ import '../platform/windows_lockdown.dart';
 import '../platform/windows_lock_state.dart';
 import '../platform/android_lockdown.dart';
 import 'negotiation_chat.dart';
-import 'home_screen.dart';
 import 'settings_screen.dart';
 import 'overlay/overlay_shell.dart';
 import 'overlay/overlay_size.dart';
@@ -237,12 +236,11 @@ class _LockdownScreenState extends State<LockdownScreen>
         await windowManager.setPreventClose(false);
       } catch (_) {}
     }
-    if (mounted) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-        (_) => false,
-      );
-    }
+    // Do NOT navigate here. fullUnlock() drives the scheduler to `unlocked`,
+    // which fires the still-mounted HomeScreen's onStateChange(unlocked) — that
+    // pops this overlay back to the existing HomeScreen. Pushing a HomeScreen
+    // here would create a DUPLICATE (with a second scheduler) on top of the
+    // real one.
     // Drop to the taskbar so the guardian stays alive without covering the screen.
     await _minimizeOutOfTheWay();
   }
@@ -250,12 +248,8 @@ class _LockdownScreenState extends State<LockdownScreen>
   void _onUnlock() {
     widget.scheduler.fullUnlock();
     WindowsLockdown.deactivate();
-    if (mounted) {
-      Navigator.of(context).pushAndRemoveUntil(
-        MaterialPageRoute(builder: (_) => const HomeScreen()),
-        (_) => false,
-      );
-    }
+    // No navigation here — see _onClose. The HomeScreen (still mounted
+    // underneath) handles popping this overlay via onStateChange(unlocked).
   }
 
   /// "Back to sleep early" from the granted view: END the active grant and

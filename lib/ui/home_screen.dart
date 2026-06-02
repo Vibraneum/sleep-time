@@ -44,6 +44,14 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _alarmsDegraded = false;
   bool _degradedBannerDismissed = false;
 
+  /// Whether the LockdownScreen route is currently pushed on top of this (still
+  /// mounted) HomeScreen. HomeScreen MUST stay mounted underneath the overlay so
+  /// its scheduler keeps ticking and can detect the morning unlock boundary —
+  /// hence we push (not pushAndRemoveUntil) and pop back here on release. The
+  /// guard prevents pushing a duplicate LockdownScreen (each push would build a
+  /// second overlay on top of the first).
+  bool _lockdownRouteOpen = false;
+
   @override
   void initState() {
     super.initState();
@@ -123,7 +131,18 @@ class _HomeScreenState extends State<HomeScreen> {
       }
     });
     unawaited(_syncPlatformLockdown(state, fromSelectiveGrant: leavingSelectiveGrant));
-    if (state == LockdownState.locked) _showLockdownScreen();
+    // Drive navigation centrally from state. HomeScreen stays mounted underneath
+    // the overlay the whole time (so the scheduler keeps ticking and will hit
+    // the morning unlock boundary), and the LockdownScreen is pushed/popped on
+    // top of it.
+    if (state == LockdownState.locked || state == LockdownState.granted) {
+      _showLockdownScreen();
+    } else {
+      // unlocked / awake / windDown / inactive: tear the overlay down and return
+      // to the still-mounted HomeScreen. This is what makes morning disengage —
+      // _syncPlatformLockdown(unlocked) above already deactivated the platform.
+      _dismissLockdownScreen();
+    }
   }
 
   Future<void> _syncPlatformLockdown(
@@ -165,14 +184,31 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Push the LockdownScreen ON TOP of this (still mounted) HomeScreen — a plain
+  /// push, NOT pushAndRemoveUntil, so HomeScreen survives as the root route and
+  /// its scheduler keeps ticking. The `_lockdownRouteOpen` guard ensures we
+  /// never stack a second overlay (e.g. on a granted transition while already
+  /// locked). LockdownScreen has PopScope(canPop:false) so Back can't escape.
   void _showLockdownScreen() {
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(
-        builder: (_) =>
-            LockdownScreen(scheduler: _scheduler, engine: _engine),
-      ),
-      (route) => false,
-    );
+    if (_lockdownRouteOpen) return;
+    _lockdownRouteOpen = true;
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute(
+            builder: (_) =>
+                LockdownScreen(scheduler: _scheduler, engine: _engine),
+          ),
+        )
+        .then((_) => _lockdownRouteOpen = false);
+  }
+
+  /// Pop back to the still-mounted HomeScreen (the first/root route) when the
+  /// state leaves lockdown — this is the morning-disengage path. No-op if the
+  /// overlay isn't open.
+  void _dismissLockdownScreen() {
+    if (!_lockdownRouteOpen) return;
+    _lockdownRouteOpen = false;
+    Navigator.of(context).popUntil((r) => r.isFirst);
   }
 
   @override

@@ -36,8 +36,17 @@ class LockdownScheduler {
   /// Manual "lock now" override (the home Test/Lock-now button). When true the
   /// scheduler reports `locked` regardless of the clock, so the real platform
   /// takeover engages on demand. Cleared by a full unlock (safe word /
-  /// end_session) and on the nightly reset.
+  /// end_session), on the nightly reset, and AUTOMATICALLY at the scheduled
+  /// morning unlock time (see [_manualLockReleaseAt]) so a manual lock can never
+  /// trap the user past wake time.
   bool _manualLock = false;
+
+  /// The instant a manual lock auto-releases — the next occurrence of the
+  /// scheduled unlock time after the lock was engaged. Once `now` reaches this,
+  /// [_computeState] clears [_manualLock] and falls through to the normal
+  /// schedule (which returns unlocked in the morning). Cleared whenever
+  /// [_manualLock] is cleared.
+  DateTime? _manualLockReleaseAt;
 
   /// The lockdown-start instant captured when we FIRST entered `locked` this
   /// night. Used by [_logSleepIfNeeded] instead of a fresh
@@ -124,8 +133,44 @@ class LockdownScheduler {
   /// the host's platform sync. Cleared by [fullUnlock] or the nightly reset.
   void forceLock() {
     _manualLock = true;
+    // A manual lock must still release at the scheduled morning unlock time so
+    // it can never trap the user past wake time.
+    _manualLockReleaseAt = nextUnlockAfter(DateTime.now());
     _permanentlyUnlocked = false;
     _updateState();
+  }
+
+  /// The next occurrence of the scheduled unlock time strictly after [from]:
+  /// today's unlock if it is still ahead, otherwise tomorrow's. Pure so it can
+  /// be unit-tested without a wall clock.
+  @visibleForTesting
+  DateTime nextUnlockAfter(DateTime from) {
+    final today = DateTime(
+      from.year,
+      from.month,
+      from.day,
+      AppConfig.unlockHour,
+      AppConfig.unlockMinute,
+    );
+    if (today.isAfter(from)) return today;
+    final tomorrow = from.add(const Duration(days: 1));
+    return DateTime(
+      tomorrow.year,
+      tomorrow.month,
+      tomorrow.day,
+      AppConfig.unlockHour,
+      AppConfig.unlockMinute,
+    );
+  }
+
+  /// True when a manual lock has reached its scheduled release time and should
+  /// be cleared. Pure (takes [now]) so the morning-release behavior is testable
+  /// without depending on the wall clock. False when there is no manual lock or
+  /// no recorded release instant.
+  @visibleForTesting
+  bool manualLockExpired(DateTime now) {
+    if (!_manualLock || _manualLockReleaseAt == null) return false;
+    return !now.isBefore(_manualLockReleaseAt!);
   }
 
   /// Persist the current grant state. Fire-and-forget; failures are swallowed
@@ -275,6 +320,7 @@ class LockdownScheduler {
       _lockdownNotified = false;
       _activeLockdownStart = null;
       _manualLock = false;
+      _manualLockReleaseAt = null;
       // Roll back any tonight-only guardian nudges for the next night.
       ScheduleStore.instance.revertTonightNudges();
       unawaited(_persistGrantState());
@@ -303,7 +349,17 @@ class LockdownScheduler {
 
     // Manual lock-now overrides the clock so the takeover can be engaged/tested
     // on demand. A grant (above) still wins so the user can always negotiate out.
-    if (_manualLock) return LockdownState.locked;
+    // BUT a manual lock must NOT trap the user past wake time: once we reach the
+    // scheduled morning unlock, clear it and fall through to the normal schedule
+    // (which returns unlocked in the morning).
+    if (_manualLock) {
+      if (manualLockExpired(now)) {
+        _manualLock = false;
+        _manualLockReleaseAt = null;
+      } else {
+        return LockdownState.locked;
+      }
+    }
 
     if (AppConfig.isLockdownTime(now)) return LockdownState.locked;
     if (AppConfig.isWindDownTime(now)) return LockdownState.windDown;
@@ -336,6 +392,7 @@ class LockdownScheduler {
     _grantExpiry = null;
     _grantAllow = const [];
     _manualLock = false;
+    _manualLockReleaseAt = null;
     _permanentlyUnlocked = true;
     _state = LockdownState.unlocked;
     onStateChange(_state);

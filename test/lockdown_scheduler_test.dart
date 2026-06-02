@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sleep_time/core/config.dart';
 import 'package:sleep_time/core/lockdown_scheduler.dart';
 import 'package:sleep_time/core/schedule.dart';
 import 'package:sleep_time/core/schedule_store.dart';
@@ -276,6 +277,70 @@ void main() {
       scheduler.grantExtension(5);
 
       expect(scheduler.state, LockdownState.granted);
+      scheduler.dispose();
+    });
+
+    test('records a release time strictly in the future (cannot trap past wake)',
+        () {
+      final scheduler = makeScheduler();
+      final before = DateTime.now();
+      scheduler.forceLock();
+      final release = scheduler.nextUnlockAfter(before);
+      expect(release.isAfter(before), isTrue,
+          reason: 'a manual lock must auto-release at the next unlock time');
+      scheduler.dispose();
+    });
+  });
+
+  group('manual lock auto-releases at the morning unlock time (#1 stuck-on)', () {
+    test(
+        'nextUnlockAfter returns today\'s unlock when it is still ahead, '
+        'else tomorrow\'s', () {
+      // Default schedule unlock is 06:00.
+      final scheduler = makeScheduler();
+      expect(AppConfig.unlockHour, 6);
+      expect(AppConfig.unlockMinute, 0);
+
+      // 03:00 → today 06:00 (still ahead).
+      final at0300 = DateTime(2026, 6, 2, 3, 0);
+      expect(scheduler.nextUnlockAfter(at0300), DateTime(2026, 6, 2, 6, 0));
+
+      // 22:15 (after today's 06:00) → next-day 06:00.
+      final at2215 = DateTime(2026, 6, 2, 22, 15);
+      expect(scheduler.nextUnlockAfter(at2215), DateTime(2026, 6, 3, 6, 0));
+
+      // Exactly at 06:00 is NOT strictly after, so roll to tomorrow.
+      final at0600 = DateTime(2026, 6, 2, 6, 0);
+      expect(scheduler.nextUnlockAfter(at0600), DateTime(2026, 6, 3, 6, 0));
+
+      scheduler.dispose();
+    });
+
+    test('manualLockExpired is false before release, true at/after it', () {
+      final scheduler = makeScheduler();
+      // forceLock records the release as nextUnlockAfter(now).
+      scheduler.forceLock();
+      expect(scheduler.state, LockdownState.locked);
+
+      final release = scheduler.nextUnlockAfter(DateTime.now());
+      // Just before the morning unlock: still locked.
+      expect(scheduler.manualLockExpired(
+              release.subtract(const Duration(minutes: 1))),
+          isFalse);
+      // At the unlock boundary and after: expired.
+      expect(scheduler.manualLockExpired(release), isTrue);
+      expect(scheduler.manualLockExpired(release.add(const Duration(hours: 1))),
+          isTrue);
+      scheduler.dispose();
+    });
+
+    test('no manual lock → manualLockExpired is always false', () {
+      final scheduler = makeScheduler();
+      expect(scheduler.manualLockExpired(DateTime.now()), isFalse);
+      expect(
+          scheduler.manualLockExpired(
+              DateTime.now().add(const Duration(days: 2))),
+          isFalse);
       scheduler.dispose();
     });
   });
