@@ -38,6 +38,14 @@ class AppConfig {
   static String anthropicModel = defaultAnthropicModel;
   static String safeWord = 'dontdie';
 
+  /// Anthropic ADAPTIVE THINKING. When ON (the default), the guardian's
+  /// Anthropic request enables `thinking:{type:'adaptive'}` so the model reasons
+  /// only on genuinely hard negotiations and answers fast otherwise. Enabling it
+  /// forces `tool_choice:auto` (thinking is incompatible with forced tool use)
+  /// and raises max_tokens for thinking headroom. Anthropic-only — the Gemini
+  /// fallback path ignores it entirely.
+  static bool adaptiveThinking = true;
+
   /// Resolve the effective Anthropic model from a persisted value: empty or a
   /// known-stale default upgrades to [defaultAnthropicModel]; anything else
   /// (a deliberate user choice) is kept as-is.

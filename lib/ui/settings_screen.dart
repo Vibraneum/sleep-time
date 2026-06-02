@@ -32,6 +32,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late bool _useBringYourOwnKey;
   late bool _runAtStartup;
   late bool _simulateLockdown;
+  late bool _adaptiveThinking;
   late TimeOfDay _wakeUpTime;
   late TimeOfDay _windDownTime;
   late TimeOfDay _lockdownTime;
@@ -49,6 +50,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _useBringYourOwnKey = AppConfig.useBringYourOwnKey;
     _runAtStartup = AppConfig.runAtStartup;
     _simulateLockdown = AppConfig.simulateLockdown;
+    _adaptiveThinking = AppConfig.adaptiveThinking;
     _wakeUpTime =
         TimeOfDay(hour: AppConfig.wakeUpHour, minute: AppConfig.wakeUpMinute);
     _windDownTime = TimeOfDay(
@@ -134,6 +136,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     await prefs.setString('safe_word', _safeWordController.text.trim());
     await prefs.setBool('run_at_startup', _runAtStartup);
     await prefs.setBool('simulate_lockdown', _simulateLockdown);
+    await prefs.setBool('adaptive_thinking', _adaptiveThinking);
 
     AppConfig.aiProvider = _provider;
     AppConfig.useBringYourOwnKey = _useBringYourOwnKey;
@@ -150,6 +153,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     AppConfig.safeWord = _safeWordController.text.trim();
     AppConfig.runAtStartup = _runAtStartup;
     AppConfig.simulateLockdown = _simulateLockdown;
+    AppConfig.adaptiveThinking = _adaptiveThinking;
     if (Platform.isWindows) {
       if (_runAtStartup && !_simulateLockdown) {
         await WindowsLockdown.registerStartup();
@@ -326,6 +330,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   'Anthropic API Key',
                   _anthropicKeyController,
                   obscure: true,
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  value: _adaptiveThinking,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text(
+                    'Let the guardian think on hard requests (adaptive)',
+                  ),
+                  subtitle: const Text(
+                    'The guardian reasons only when a negotiation genuinely '
+                    'needs it, and answers fast otherwise.',
+                  ),
+                  onChanged: (value) {
+                    setState(() => _adaptiveThinking = value);
+                  },
                 ),
               ],
             ]),

@@ -4,7 +4,17 @@ import 'package:sleep_time/core/negotiation_engine.dart';
 
 void main() {
   group('buildAnthropicToolRequest', () {
-    test('emits the tool set, tool_choice=any, no parallel tool use', () {
+    // Adaptive thinking flips the request shape; set it explicitly per test and
+    // restore the default so tests never leak state into each other.
+    setUp(() {
+      AppConfig.adaptiveThinking = true;
+    });
+    tearDown(() {
+      AppConfig.adaptiveThinking = true;
+    });
+
+    test('emits the tool set, no parallel tool use', () {
+      AppConfig.adaptiveThinking = false;
       final body = buildAnthropicToolRequest(
         systemPrompt: 'you are the guardian.',
         messages: const [],
@@ -25,11 +35,46 @@ void main() {
         'end_session',
       ]);
 
-      expect(body['tool_choice'], {'type': 'any'});
       expect(body['disable_parallel_tool_use'], isTrue);
       expect(body['model'], AppConfig.anthropicModel);
       expect(body['model'], AppConfig.defaultAnthropicModel);
       expect(AppConfig.defaultAnthropicModel, 'claude-sonnet-4-6');
+    });
+
+    test('adaptive thinking ON: thinking + auto + low effort + headroom', () {
+      AppConfig.adaptiveThinking = true;
+      final body = buildAnthropicToolRequest(
+        systemPrompt: 'you are the guardian.',
+        messages: const [],
+      );
+
+      // Thinking is incompatible with forced tool use, so tool_choice MUST be
+      // auto (any/tool would 400).
+      expect(body['tool_choice'], {'type': 'auto'});
+      expect(body['thinking'], {'type': 'adaptive'});
+      expect((body['output_config'] as Map)['effort'], 'low');
+      expect(body['disable_parallel_tool_use'], isTrue);
+      // Thinking needs headroom.
+      expect(body['max_tokens'] as int, greaterThanOrEqualTo(4096));
+      // Sampling params 400 with thinking enabled — temperature must be omitted.
+      expect(body.containsKey('temperature'), isFalse);
+    });
+
+    test('adaptive thinking OFF: legacy shape (any, no thinking)', () {
+      AppConfig.adaptiveThinking = false;
+      final body = buildAnthropicToolRequest(
+        systemPrompt: 'you are the guardian.',
+        messages: const [],
+        maxTokens: 500,
+      );
+
+      expect(body['tool_choice'], {'type': 'any'});
+      expect(body.containsKey('thinking'), isFalse);
+      expect(body.containsKey('output_config'), isFalse);
+      expect(body['disable_parallel_tool_use'], isTrue);
+      expect(body['max_tokens'], 500);
+      // Legacy path keeps sending temperature (no thinking, so it's allowed).
+      expect(body['temperature'], isNotNull);
     });
 
     test('cache_control (1h TTL) on the LAST system block and the LAST tool',
@@ -53,7 +98,8 @@ void main() {
       }
     });
 
-    test('tool_choice is constant across calls in a session', () {
+    test('tool_choice is constant across calls in a session (thinking off)', () {
+      AppConfig.adaptiveThinking = false;
       final first = buildAnthropicToolRequest(
         systemPrompt: 'prompt',
         messages: const [],
@@ -67,6 +113,23 @@ void main() {
 
       expect(first['tool_choice'], second['tool_choice']);
       expect(first['tool_choice'], {'type': 'any'});
+    });
+
+    test('tool_choice is constant across calls in a session (thinking on)', () {
+      AppConfig.adaptiveThinking = true;
+      final first = buildAnthropicToolRequest(
+        systemPrompt: 'prompt',
+        messages: const [],
+      );
+      final second = buildAnthropicToolRequest(
+        systemPrompt: 'prompt',
+        messages: const [
+          {'role': 'user', 'content': 'hi'},
+        ],
+      );
+
+      expect(first['tool_choice'], second['tool_choice']);
+      expect(first['tool_choice'], {'type': 'auto'});
     });
 
     test('does not mutate the shared const tool definitions', () {

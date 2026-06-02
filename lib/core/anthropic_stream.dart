@@ -15,6 +15,18 @@ import 'dart:convert';
 ///      via [extractPartialJsonStringField] (injected) so the UI can render it
 ///      live.
 ///
+/// With adaptive thinking enabled (tool_choice:auto), a turn can also contain a
+/// `thinking` block (streamed via `thinking_delta` + a `signature_delta`) and a
+/// `text` block (streamed via `text_delta`) BEFORE the optional `tool_use`
+/// block. This accumulator captures all three per content-block index, in
+/// arrival order, so the engine can:
+///   1. reconstruct the ORDERED assistant content `[thinking(+signature),
+///      text?, tool_use?]` to commit to history (thinking blocks WITH their
+///      signature MUST be preserved before a tool_use, or the follow-up
+///      tool_result turn 400s), and
+///   2. surface the user-facing text (the tool's `message`, else the streamed
+///      text block) live — never the thinking text.
+///
 /// Feed it raw SSE event types + their decoded `data` JSON via [handleEvent].
 /// It carries NO network code so it is fully unit-testable with canned events.
 class AnthropicStreamAccumulator {
@@ -27,6 +39,18 @@ class AnthropicStreamAccumulator {
 
   /// Per-block-index accumulated `input_json_delta` partial_json fragments.
   final Map<int, StringBuffer> _toolInputByIndex = {};
+
+  /// Per-block-index accumulated `thinking_delta` text and the captured
+  /// `signature_delta` signature.
+  final Map<int, StringBuffer> _thinkingByIndex = {};
+  final Map<int, String> _signatureByIndex = {};
+
+  /// Per-block-index accumulated `text_delta` text.
+  final Map<int, StringBuffer> _textByIndex = {};
+
+  /// Content-block indices in the order they were opened, so we can rebuild the
+  /// ordered assistant content list the API requires.
+  final List<int> _blockOrder = [];
 
   /// The content-block index of the tool_use block (the only one we care about
   /// for the guardian; there is at most one per turn).
@@ -42,6 +66,55 @@ class AnthropicStreamAccumulator {
   String? get toolName => _toolName;
   String? get toolUseId => _toolUseId;
   String? get stopReason => _stopReason;
+
+  /// The accumulated streamed `text` block (plain text the model wrote outside
+  /// any tool call), or null if no text block streamed. Used as the user-facing
+  /// message ONLY when no tool was produced (a keep-talking `auto` reply).
+  String? get textBlock {
+    for (final index in _blockOrder) {
+      final buf = _textByIndex[index];
+      if (buf != null) return buf.toString();
+    }
+    return null;
+  }
+
+  /// Reconstruct the ORDERED assistant content blocks exactly as the API
+  /// returned them, ready to append to history: `thinking(+signature)`, then any
+  /// `text`, then any `tool_use`, in arrival order. Only blocks that actually
+  /// appeared are included. Thinking blocks carry their `signature` verbatim so
+  /// the next turn's tool_result is valid. Pass the fully-decoded [toolInput]
+  /// (the engine decodes it once at stream end) so the tool_use block embeds the
+  /// parsed input rather than the raw JSON string.
+  List<Map<String, dynamic>> orderedContent(Map<String, dynamic> toolInput) {
+    final content = <Map<String, dynamic>>[];
+    for (final index in _blockOrder) {
+      final thinking = _thinkingByIndex[index];
+      if (thinking != null) {
+        final block = <String, dynamic>{
+          'type': 'thinking',
+          'thinking': thinking.toString(),
+        };
+        final sig = _signatureByIndex[index];
+        if (sig != null) block['signature'] = sig;
+        content.add(block);
+        continue;
+      }
+      final text = _textByIndex[index];
+      if (text != null) {
+        content.add({'type': 'text', 'text': text.toString()});
+        continue;
+      }
+      if (index == _toolBlockIndex && _toolName != null) {
+        content.add({
+          'type': 'tool_use',
+          'id': _toolUseId,
+          'name': _toolName,
+          'input': toolInput,
+        });
+      }
+    }
+    return content;
+  }
 
   /// The full accumulated tool-input JSON string (may be empty / incomplete if
   /// the stream ended early). Decode this at stream end.
@@ -85,11 +158,21 @@ class AnthropicStreamAccumulator {
         final index = (data['index'] as num?)?.toInt();
         final block = data['content_block'];
         if (index != null && block is Map) {
-          if (block['type'] == 'tool_use') {
+          _trackBlockOrder(index);
+          final type = block['type'];
+          if (type == 'tool_use') {
             _toolBlockIndex = index;
             _toolName = block['name'] as String?;
             _toolUseId = block['id'] as String?;
             _toolInputByIndex.putIfAbsent(index, () => StringBuffer());
+          } else if (type == 'thinking') {
+            _thinkingByIndex.putIfAbsent(index, () => StringBuffer());
+            // A signature may already be present on the start block in some
+            // shapes; capture it if so.
+            final sig = block['signature'];
+            if (sig is String && sig.isNotEmpty) _signatureByIndex[index] = sig;
+          } else if (type == 'text') {
+            _textByIndex.putIfAbsent(index, () => StringBuffer());
           }
         }
         return null;
@@ -97,21 +180,56 @@ class AnthropicStreamAccumulator {
         final index = (data['index'] as num?)?.toInt();
         final delta = data['delta'];
         if (index == null || delta is! Map) return null;
-        if (delta['type'] == 'input_json_delta') {
+        final deltaType = delta['type'];
+        if (deltaType == 'input_json_delta') {
           final partial = delta['partial_json'];
           if (partial is String) {
+            _trackBlockOrder(index);
             _toolInputByIndex.putIfAbsent(index, () => StringBuffer()).write(
                   partial,
                 );
             // Only the tool block drives the live message; if we haven't seen a
-            // content_block_start for a tool_use yet, treat the first
+            // content_block_start for a tool_use yet, treat this
             // input_json_delta block as the tool block.
             _toolBlockIndex ??= index;
             return _maybeEmitMessage();
           }
+          return null;
         }
-        // text_delta and other delta types are not used for the guardian's
-        // message (it lives in tool input), so they are ignored here.
+        if (deltaType == 'thinking_delta') {
+          final partial = delta['thinking'];
+          if (partial is String) {
+            _trackBlockOrder(index);
+            _thinkingByIndex
+                .putIfAbsent(index, () => StringBuffer())
+                .write(partial);
+          }
+          // Thinking text is NEVER surfaced as the user-facing message (the UI
+          // shows a thinking indicator already).
+          return null;
+        }
+        if (deltaType == 'signature_delta') {
+          final sig = delta['signature'];
+          if (sig is String && sig.isNotEmpty) {
+            _trackBlockOrder(index);
+            // The signature arrives whole (not fragmented); capture it verbatim.
+            _signatureByIndex[index] = sig;
+          }
+          return null;
+        }
+        if (deltaType == 'text_delta') {
+          final partial = delta['text'];
+          if (partial is String) {
+            _trackBlockOrder(index);
+            _textByIndex
+                .putIfAbsent(index, () => StringBuffer())
+                .write(partial);
+            // Surface streamed text live ONLY while no tool is being produced —
+            // a tool's `message` takes precedence once it appears.
+            return _maybeEmitTextMessage();
+          }
+          return null;
+        }
         return null;
       case 'message_delta':
         final delta = data['delta'];
@@ -119,8 +237,17 @@ class AnthropicStreamAccumulator {
           _stopReason = delta['stop_reason'] as String?;
         }
         return null;
-      case 'message_start':
       case 'content_block_stop':
+        // Some shapes carry the thinking signature on the stop event (or on a
+        // trailing content_block). Capture it if we haven't already.
+        final index = (data['index'] as num?)?.toInt();
+        final block = data['content_block'];
+        if (index != null && block is Map) {
+          final sig = block['signature'];
+          if (sig is String && sig.isNotEmpty) _signatureByIndex[index] = sig;
+        }
+        return null;
+      case 'message_start':
       case 'message_stop':
       case 'ping':
       default:
@@ -128,8 +255,26 @@ class AnthropicStreamAccumulator {
     }
   }
 
+  /// Record a content-block index the first time it is seen so [orderedContent]
+  /// can rebuild the assistant content in arrival order.
+  void _trackBlockOrder(int index) {
+    if (!_blockOrder.contains(index)) _blockOrder.add(index);
+  }
+
   String? _maybeEmitMessage() {
     final snapshot = currentMessage;
+    if (snapshot == null) return null;
+    if (snapshot == _lastMessageSnapshot) return null;
+    _lastMessageSnapshot = snapshot;
+    return snapshot;
+  }
+
+  /// Emit the streamed text block as the live message, but only while no tool
+  /// is being produced (the tool's `message` field wins once it appears). This
+  /// surfaces a keep-talking `auto` reply live without leaking thinking text.
+  String? _maybeEmitTextMessage() {
+    if (_toolBlockIndex != null) return null;
+    final snapshot = textBlock;
     if (snapshot == null) return null;
     if (snapshot == _lastMessageSnapshot) return null;
     _lastMessageSnapshot = snapshot;

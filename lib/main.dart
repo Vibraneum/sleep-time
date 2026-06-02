@@ -132,6 +132,10 @@ Future<void> _loadConfig({SecureKeyStore? secureKeyStore}) async {
 
   AppConfig.safeWord = prefs.getString('safe_word') ?? 'dontdie';
 
+  // Adaptive thinking defaults ON (the owner asked for it). Anthropic-only at
+  // request-build time; the Gemini fallback path ignores it.
+  AppConfig.adaptiveThinking = prefs.getBool('adaptive_thinking') ?? true;
+
   // Resolution order for simulate-lockdown:
   //   1. compile-time --dart-define=SIMULATE_LOCKDOWN=...
   //   2. previously-saved user preference

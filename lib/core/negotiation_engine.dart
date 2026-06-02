@@ -125,15 +125,25 @@ class GuardianDecision {
 }
 
 /// Build the Anthropic Messages tool-use request body. Extracted so the
-/// body-shape (tools, tool_choice, cache_control placement) is unit-testable
-/// without the network.
+/// body-shape (tools, tool_choice, cache_control placement, thinking) is
+/// unit-testable without the network.
 ///
 /// Caching invariants:
 /// - `system` is an ARRAY of blocks; the LAST block carries cache_control.
 /// - The LAST tool carries cache_control.
-/// - `tool_choice` is held CONSTANT for the whole session (changing it
-///   mid-session invalidates the prompt cache), so the builder always emits
-///   `{type: 'any'}`.
+///
+/// tool_choice depends on [AppConfig.adaptiveThinking]:
+/// - OFF: `{type:'any'}` (force a tool call — the legacy shape). `temperature`
+///   is sent.
+/// - ON:  `{type:'auto'}` (REQUIRED — thinking is incompatible with forced tool
+///   use; `any`/`tool` returns 400 when thinking is enabled). Adaptive thinking
+///   plus `output_config.effort:low` keeps reasoning gated + shallow so latency
+///   stays reasonable, max_tokens is raised for thinking headroom, and
+///   `temperature` is OMITTED (sampling params are incompatible with thinking
+///   and 400 on current models).
+///
+/// The cache_control breakpoints DO NOT move when thinking toggles — enabling
+/// thinking only flips tool_choice + adds the thinking/output_config keys.
 @visibleForTesting
 Map<String, dynamic> buildAnthropicToolRequest({
   required String systemPrompt,
@@ -141,6 +151,7 @@ Map<String, dynamic> buildAnthropicToolRequest({
   int maxTokens = 500,
   double temperature = 0.7,
 }) {
+  final thinkingOn = AppConfig.adaptiveThinking;
   // System as an array of blocks; cache_control on the LAST block. The 1h TTL
   // (GA) keeps the system+tools prefix cached across a whole bedtime session —
   // negotiation can span hours with long idle gaps, so 5m would expire between
@@ -161,16 +172,36 @@ Map<String, dynamic> buildAnthropicToolRequest({
       .toList();
   tools.last['cache_control'] = {'type': 'ephemeral', 'ttl': '1h'};
 
-  return {
+  // Thinking needs headroom so the (short) message + thinking aren't truncated.
+  // When thinking is on, floor max_tokens at 4096 — we stream, so a larger
+  // max_tokens does not hurt latency.
+  final effectiveMaxTokens =
+      thinkingOn && maxTokens < 4096 ? 4096 : maxTokens;
+
+  final body = <String, dynamic>{
     'model': AppConfig.anthropicModel,
-    'max_tokens': maxTokens,
-    'temperature': temperature,
+    'max_tokens': effectiveMaxTokens,
     'system': system,
     'tools': tools,
-    'tool_choice': {'type': 'any'},
+    // Thinking is incompatible with forced tool use: `any`/`tool` returns 400
+    // when thinking is enabled. So use `auto` when thinking is on, `any` off.
+    'tool_choice': thinkingOn ? {'type': 'auto'} : {'type': 'any'},
     'disable_parallel_tool_use': true,
     'messages': messages,
   };
+
+  if (thinkingOn) {
+    body['thinking'] = {'type': 'adaptive'};
+    body['output_config'] = {'effort': 'low'};
+    // Sampling params are INCOMPATIBLE with thinking: `temperature`/`top_p`/
+    // `top_k` are removed when thinking is enabled and 400 on current models
+    // (and are constrained to the default on older thinking models). So omit
+    // `temperature` entirely when thinking is on — only send it when off.
+  } else {
+    body['temperature'] = temperature;
+  }
+
+  return body;
 }
 
 /// Build the content list for a new user turn. When a tool_use from the prior
@@ -363,10 +394,11 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   String _providerSuffix() {
     switch (AppConfig.aiProvider) {
       case AiProvider.anthropic:
-        return 'You act ONLY by calling exactly one tool per reply. The user-facing '
-            'text goes in that tool\'s `message` field — never write prose outside a '
-            'tool call. Use guardian_action with "deny" to keep talking without '
-            'ending the negotiation.';
+        return 'Respond by calling exactly one tool; put your words in the tool\'s '
+            '`message` field. The user-facing text goes ONLY in that `message` '
+            'field. Use guardian_action with "deny" to keep talking without ending '
+            'the negotiation. Only if you are merely thinking out loud '
+            'mid-conversation may you reply with plain text instead of a tool call.';
       case AiProvider.gemini:
         return 'When making a final grant/deny/lock decision, put the JSON decision '
             'object on the LAST line ONLY, e.g. {"decision":"deny"}. NEVER write '
@@ -385,8 +417,10 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
           {'role': 'user', 'content': 'warmup'},
         ],
         // max_tokens MUST be >=1 here: the API rejects max_tokens:0 together
-        // with tool_choice:{type:'any'} (400), and this request always carries
-        // tool_choice:any. 1 token of prefill is enough to write the cache.
+        // with tool_choice:{type:'any'} (400). With adaptive thinking ON the
+        // builder floors max_tokens at 4096 (thinking needs headroom) and uses
+        // tool_choice:auto; either way 1 is a safe lower bound to ask for —
+        // enough to write the cache.
         maxTokens: 1,
       );
       await http
@@ -680,8 +714,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   /// Commit a successful turn to history and map it to a final decision. Shared
   /// by the streaming and non-streaming paths so the tool_result-FIRST ordering
   /// and tool_use_id tracking stay byte-identical between them. [content] is the
-  /// assistant content block list to persist; [toolName]/[toolInput]/[toolId]
-  /// are the parsed tool_use fields.
+  /// FULL ordered assistant content block list to persist verbatim
+  /// (`thinking(+signature)`, optional `text`, optional `tool_use`) — with
+  /// adaptive thinking the thinking block WITH its signature MUST precede the
+  /// tool_use here or the next turn's tool_result 400s. [toolName]/[toolInput]/
+  /// [toolId] are the parsed tool_use fields, or null when this was a
+  /// text-only (keep-talking) `auto` reply with no tool call.
   ///
   /// Do NOT mutate _anthropicHistory / _lastToolUseId / _pendingToolResultAck
   /// until the request has succeeded and parsed — otherwise a timeout / non-2xx
@@ -689,18 +727,32 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   Future<GuardianDecision> _commitAnthropicTurn({
     required Map<String, dynamic> nextUserTurn,
     required List<dynamic> content,
-    required String toolName,
+    required String? toolName,
     required Map<String, dynamic> toolInput,
     required String? toolId,
+    String? textOnlyMessage,
   }) async {
-    // Success: NOW commit the user turn + assistant content (incl. the tool_use
-    // block) to history and track the tool_use_id for the next turn's
-    // tool_result. _pendingToolResultAck resets to the generic ack here; only
-    // adjust_schedule re-sets it below.
+    // Success: NOW commit the user turn + assistant content (incl. any thinking
+    // + the tool_use block) to history. _lastToolUseId is set ONLY when a
+    // tool_use actually occurred — so the NEXT user turn prepends a tool_result
+    // only then (a text-only turn has no tool_use_id to answer).
+    // _pendingToolResultAck resets to the generic ack here; only adjust_schedule
+    // re-sets it below.
     _anthropicHistory.add(nextUserTurn);
     _anthropicHistory.add({'role': 'assistant', 'content': content});
     _lastToolUseId = toolId;
     _pendingToolResultAck = 'noted.';
+
+    // No tool_use this turn (a keep-talking `auto` reply with only text): there
+    // is no terminal decision, so present it as a deny so the chat stays live.
+    if (toolName == null) {
+      return GuardianDecision(
+        message: (textOnlyMessage != null && textOnlyMessage.trim().isNotEmpty)
+            ? textOnlyMessage
+            : 'no.',
+        action: GuardianAction.deny,
+      );
+    }
 
     final decision = guardianDecisionFromToolUse(toolName, toolInput);
 
@@ -788,18 +840,39 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       ));
     }
 
-    // Find the single tool_use block.
+    // Find the single tool_use block and (for an `auto` text-only reply) the
+    // first text block. With adaptive thinking on, content may lead with a
+    // thinking block; we commit `content` VERBATIM so the thinking block and its
+    // signature are preserved ahead of any tool_use (required for the follow-up
+    // tool_result to be valid).
     Map<String, dynamic>? toolUse;
+    String? textBlock;
     for (final block in content) {
-      if (block is Map<String, dynamic> && block['type'] == 'tool_use') {
+      if (block is! Map<String, dynamic>) continue;
+      if (block['type'] == 'tool_use' && toolUse == null) {
         toolUse = block;
-        break;
+      } else if (block['type'] == 'text' && textBlock == null) {
+        final t = block['text'];
+        if (t is String) textBlock = t;
       }
     }
 
     if (toolUse == null) {
-      // No tool_use found (incl. max_tokens with no complete block) — never
-      // reach the text parser on the Anthropic path; safe deny.
+      // No tool_use. With tool_choice:auto this can be a legitimate keep-talking
+      // reply: if there is text, surface it (commit the turn so history stays in
+      // sync and the thinking signature is preserved). With no text either
+      // (e.g. a max_tokens cutoff with no usable block), safe deny WITHOUT
+      // committing — there is nothing coherent to persist.
+      if (textBlock != null && textBlock.trim().isNotEmpty) {
+        return _commitAnthropicTurn(
+          nextUserTurn: nextUserTurn,
+          content: content,
+          toolName: null,
+          toolInput: const <String, dynamic>{},
+          toolId: null,
+          textOnlyMessage: textBlock,
+        );
+      }
       return Future.value(GuardianDecision(
         message: 'no.',
         action: GuardianAction.deny,
@@ -945,12 +1018,27 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         );
       }
 
-      // Assemble the final tool-input JSON and map it. If anything is missing
-      // (no tool block, undecodable JSON — incl. a max_tokens cutoff that left
-      // the tool input incomplete), fall back to non-streaming.
+      // Assemble the final tool-input JSON and map it.
       final toolName = acc.toolName;
       final toolInputJson = acc.toolInputJson;
+
+      // No tool block produced. With tool_choice:auto (adaptive thinking on)
+      // this can be a legitimate keep-talking reply carrying only a text block —
+      // commit it verbatim (thinking signature preserved, no tool_use_id set) so
+      // the next turn doesn't prepend a stray tool_result. If there's no text
+      // either (e.g. a truncated tool block), fall back to non-streaming.
       if (toolName == null || toolInputJson.trim().isEmpty) {
+        final text = acc.textBlock;
+        if (text != null && text.trim().isNotEmpty) {
+          return _commitAnthropicTurn(
+            nextUserTurn: nextUserTurn,
+            content: acc.orderedContent(const <String, dynamic>{}),
+            toolName: null,
+            toolInput: const <String, dynamic>{},
+            toolId: null,
+            textOnlyMessage: text,
+          );
+        }
         return _sendAnthropicToolUse(userMessage);
       }
       final Map<String, dynamic> input = acc.decodeToolInput();
@@ -958,18 +1046,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         return _sendAnthropicToolUse(userMessage);
       }
 
-      // Reconstruct the assistant content block to persist EXACTLY as the
-      // non-streaming path would have received it.
-      final toolUseBlock = <String, dynamic>{
-        'type': 'tool_use',
-        'id': acc.toolUseId,
-        'name': toolName,
-        'input': input,
-      };
-
+      // Reconstruct the FULL ordered assistant content the same way the
+      // non-streaming path receives it: any thinking(+signature) and text block
+      // BEFORE the tool_use, so the next turn's tool_result is valid.
       return _commitAnthropicTurn(
         nextUserTurn: nextUserTurn,
-        content: [toolUseBlock],
+        content: acc.orderedContent(input),
         toolName: toolName,
         toolInput: input,
         toolId: acc.toolUseId,
