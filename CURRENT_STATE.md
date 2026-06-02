@@ -32,15 +32,19 @@ Sleep Time is currently a Windows-first Flutter bedtime-boundary app with:
 ## What Windows lockdown does today
 
 The app currently attempts to:
-- enter fullscreen
-- stay always on top
-- prevent normal close flow
-- hide from the taskbar
-- periodically refocus itself
-- best-effort disable some shell shortcuts and policies through registry writes
-- best-effort stop Explorer during active lockdown in release mode
-- restore Explorer and related state on unlock
+- enter fullscreen, stay always on top, and prevent the normal close flow
+- block a low-level keyboard hook (Win / Alt+Tab / Alt+F4 / Esc combos)
+- reclaim focus **event-driven** via `SetWinEventHook` on the foreground event
+  (no busy polling loop — near-zero idle CPU; replaced the old 500 ms Dart timer
+  and 150 ms PowerShell guardian)
+- run a sibling **watchdog process** that relaunches the app if it is killed while
+  locked (never spawned in safe mode)
+- **selectively** allow specific approved apps for a limited grant while blocking
+  the rest of the desktop (corner countdown HUD)
 - restore system state on next startup if the prior session crashed mid-lockdown
+
+It no longer writes shell-policy registry keys or kills Explorer (both were removed
+as too dangerous on crash).
 
 ## What Windows lockdown does not guarantee
 
@@ -93,29 +97,34 @@ iOS is not yet supported (no `ios/` runner). A real iOS port would need to use t
 ## AI/provider status
 
 Implemented:
-- Gemini support
-- Anthropic support
-- BYOK
-- Concierge Gemini build-time fallback
-- model selection in settings
+- **Anthropic Claude tool-calling guardian** (default `claude-sonnet-4-5`): a 4-tool
+  set (`guardian_action`, `unlock_app`, `adjust_schedule`, `end_session`), one
+  decision per turn, prompt-cached, tool_result-first content-block history — no
+  more JSON-on-the-last-line parsing
+- Gemini retained as a quarantined text-parsing fallback (the pinned package can't
+  do typed tool use)
+- BYOK + Concierge Gemini build-time fallback + model selection in settings
 
 Still desirable later:
-- richer retries / backoff
-- clearer rate-limit UX
-- provider-specific error normalization
+- richer retries / backoff and clearer rate-limit UX
 - deeper tests around malformed model output
 
 ## Test status
 
-Passing now:
-- `flutter analyze`
-- `flutter test`
-- `flutter build windows --release`
+Passing now (all independently verified):
+- `flutter analyze` (clean)
+- `flutter test` (150 tests)
+- `flutter build windows --release` (produces both `sleep_time.exe` and
+  `sleep_time_watchdog.exe`)
+- `flutter build apk --debug`
 
-Coverage is still modest. Most important future test expansions:
-- scheduler edge cases around midnight
-- negotiation parsing edge cases
-- Windows-specific recovery / restore behavior
+Coverage is meaningfully expanded (schedule validation + guardrails, tool-use
+mapping + request/history shape, store/audit, selective-unlock gating, overlay/
+onboarding logic). Most valuable next expansions:
+- on-device Android QA (alarm firing, Doze, overlay, boot recovery, battery)
+- on-device Windows enforcement QA on a throwaway account (kill-recovery, focus
+  reclaim, selective allow)
+- native (Kotlin/C++) unit/instrumentation tests
 
 ## Release/distribution status
 
@@ -130,11 +139,14 @@ The repo now includes:
 
 ## Near-term priorities
 
-1. strengthen Windows recovery and optional watchdog support
-2. deepen scheduler / parser test coverage
-3. add code-signing guidance for Windows releases
-4. validate Android behavior on real devices
-5. document the Windows threat model clearly for contributors and users
+1. on-device QA: Android (alarms/Doze/overlay/boot/battery) and Windows enforcement
+   on a throwaway account (kill-recovery, focus reclaim, selective allow)
+2. obtain a code-signing certificate and sign the Windows binaries + installer
+3. product sign-off on the schedule guardrail envelope/cap constants
+   (`lib/core/schedule_guardrails.dart`)
+4. Play Console submission (declarations + demo videos per `docs/PLAY_SUBMISSION.md`)
+5. the `full` sideload Android flavor (broader permissions) behind the Capabilities seam
+6. native (Kotlin/C++) unit + instrumentation tests
 
 ## Android (Play-compliant) architecture — M4
 
