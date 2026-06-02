@@ -107,7 +107,7 @@ class WindowsLockdown {
         '/t',
         'REG_SZ',
         '/d',
-        exePath,
+        '"$exePath"',
         '/f',
       ]);
       final watchdog = _watchdogPath();
@@ -120,7 +120,7 @@ class WindowsLockdown {
           '/t',
           'REG_SZ',
           '/d',
-          watchdog,
+          '"$watchdog"',
           '/f',
         ]);
       }

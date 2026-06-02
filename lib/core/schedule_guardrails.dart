@@ -143,6 +143,15 @@ class ScheduleGuardrails {
 
   static const int _dayMinutes = 24 * 60;
 
+  /// The only schedule fields the guardian may touch. Anything else is a
+  /// malformed tool call and must be rejected, not silently coerced.
+  static const Set<String> validFields = {
+    'wakeUp',
+    'windDown',
+    'lockdown',
+    'unlock',
+  };
+
   /// Pull the [ScheduleTime] for a named field from a schedule.
   static ScheduleTime _field(SleepSchedule s, String field) {
     switch (field) {
@@ -249,6 +258,16 @@ class ScheduleGuardrails {
     required NightlyAiBudget budget,
     required bool lockdownActive,
   }) {
+    // Reject unknown fields up front so a malformed tool call fails CLOSED
+    // instead of silently coercing to the lockdown branch / a no-op apply.
+    if (!validFields.contains(field)) {
+      return GuardrailDecision(
+        outcome: GuardrailOutcome.rejected,
+        applied: current,
+        humanReason: 'unknown schedule field: $field',
+      );
+    }
+
     // Edit-count cap first — independent of which field is touched.
     if (budget.editsUsed >= maxAiEditsPerNight) {
       return GuardrailDecision(

@@ -118,6 +118,18 @@ class _LockdownScreenState extends State<LockdownScreen>
     await _onUnlockAppWindows(identifier, grantMinutes);
   }
 
+  /// Fall back to a full (non-selective) timed grant. Because a full grant frees
+  /// the whole device, any leftover per-app label is now wrong, so clear it so
+  /// the granted overlay doesn't keep showing a stale borrowed-app name.
+  void _grantFullFallback(int minutes) {
+    if (mounted) {
+      setState(() => _grantedAppLabel = null);
+    } else {
+      _grantedAppLabel = null;
+    }
+    widget.scheduler.grantExtension(minutes);
+  }
+
   Future<void> _onUnlockAppWindows(String identifier, int minutes) async {
     // Gate on the user-approved negotiable-app set exactly like Android: the
     // guardian may only selectively unlock apps the user explicitly approved in
@@ -128,7 +140,7 @@ class _LockdownScreenState extends State<LockdownScreen>
       // Not on the approved list (or unresolvable). Degrade to a normal full
       // timed grant so the guardian's decision still does something honest,
       // rather than freeing an unapproved process.
-      widget.scheduler.grantExtension(minutes);
+      _grantFullFallback(minutes);
       return;
     }
 
@@ -137,7 +149,7 @@ class _LockdownScreenState extends State<LockdownScreen>
     // an image name there); fall back to the friendly label.
     final allow = WindowsAppResolver.resolveAll([approved.package, approved.label]);
     if (allow.isEmpty) {
-      widget.scheduler.grantExtension(minutes);
+      _grantFullFallback(minutes);
       return;
     }
     widget.scheduler.grantSelective(allow: allow, minutes: minutes);
@@ -152,7 +164,7 @@ class _LockdownScreenState extends State<LockdownScreen>
       // Not on the approved negotiable-apps list (or unresolvable). Degrade to a
       // normal timed grant so the guardian's decision still does *something*
       // honest rather than silently allowing an unapproved app.
-      widget.scheduler.grantExtension(minutes);
+      _grantFullFallback(minutes);
       return;
     }
     final ok = await AndroidLockdown.allowApp(
@@ -162,7 +174,7 @@ class _LockdownScreenState extends State<LockdownScreen>
     );
     if (!mounted) return;
     if (!ok) {
-      widget.scheduler.grantExtension(minutes);
+      _grantFullFallback(minutes);
       return;
     }
     widget.scheduler.grantSelective(allow: [resolved.package], minutes: minutes);
@@ -205,6 +217,21 @@ class _LockdownScreenState extends State<LockdownScreen>
         (_) => false,
       );
     }
+  }
+
+  /// "Back to sleep early" from the granted view: END the active grant and
+  /// RETURN to the locked overlay — this is NOT a full unlock for the night.
+  /// [endGrantEarly] clears the grant without setting permanentlyUnlocked and
+  /// recomputes to `locked`, which fires onStateChange → _syncPlatformLockdown
+  /// → WindowsLockdown.activate() so the takeover re-arms. We drop the per-app
+  /// label so the overlay no longer shows the borrowed app as unlocked.
+  void _onEndGrantEarly() {
+    if (mounted) {
+      setState(() => _grantedAppLabel = null);
+    } else {
+      _grantedAppLabel = null;
+    }
+    widget.scheduler.endGrantEarly();
   }
 
   /// The engine already applied the schedule change (through the guardrails and
@@ -497,7 +524,7 @@ class _LockdownScreenState extends State<LockdownScreen>
                   remaining: remaining,
                   appLabel: _grantedAppLabel,
                   onTapExpand: () => setState(() => _showChat = true),
-                  onEndEarly: _onUnlock,
+                  onEndEarly: _onEndGrantEarly,
                 ),
               ),
               // A gentle label so a full-screen grant view isn't just an empty

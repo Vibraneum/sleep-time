@@ -110,6 +110,82 @@ void main() {
     });
   });
 
+  group('endGrantEarly (#2 back to sleep early)', () {
+    test('from a grant returns to locked and does NOT permanently unlock', () {
+      var lastState = LockdownState.unlocked;
+      final scheduler = makeScheduler(onState: (s) => lastState = s);
+      // Force a manual lock so the post-grant recompute returns to locked
+      // regardless of the wall clock the test runs under.
+      scheduler.forceLock();
+      scheduler.grantExtension(20);
+      expect(scheduler.state, LockdownState.granted);
+
+      scheduler.endGrantEarly();
+
+      expect(scheduler.state, LockdownState.locked,
+          reason: 'ending the grant early must re-lock, not unlock');
+      expect(lastState, LockdownState.locked);
+      expect(scheduler.permanentlyUnlocked, isFalse,
+          reason: 'endGrantEarly must never permanently unlock');
+      expect(scheduler.grantExpiry, isNull);
+      expect(scheduler.grantAllow, isEmpty);
+      scheduler.dispose();
+    });
+
+    test('clears a selective grant too', () {
+      final scheduler = makeScheduler();
+      scheduler.forceLock();
+      scheduler.grantSelective(allow: ['chrome.exe'], minutes: 15);
+      expect(scheduler.isSelectiveGrant, isTrue);
+
+      scheduler.endGrantEarly();
+
+      expect(scheduler.state, LockdownState.locked);
+      expect(scheduler.isSelectiveGrant, isFalse);
+      expect(scheduler.grantAllow, isEmpty);
+      expect(scheduler.permanentlyUnlocked, isFalse);
+      scheduler.dispose();
+    });
+
+    test('is a no-op when there is no active grant', () {
+      final scheduler = makeScheduler();
+      scheduler.forceLock();
+      scheduler.endGrantEarly();
+      expect(scheduler.state, LockdownState.locked);
+      scheduler.dispose();
+    });
+  });
+
+  group('restoreGrantState night key (#6)', () {
+    test('discards stale counters from a previous night on restore', () async {
+      final yesterday = LockdownScheduler.nightKeyFor(
+          DateTime.now().subtract(const Duration(days: 1, hours: 12)));
+      SharedPreferences.setMockInitialValues({
+        'grants_used_tonight': 3,
+        'granted_minutes_tonight': 90,
+        'grant_night': yesterday,
+      });
+      final scheduler = makeScheduler();
+      await scheduler.restoreGrantState();
+      expect(scheduler.grantsUsedTonight, 0,
+          reason: 'yesterday counters must reset');
+      scheduler.dispose();
+    });
+
+    test('keeps counters that belong to tonight', () async {
+      final tonight = LockdownScheduler.nightKeyFor(DateTime.now());
+      SharedPreferences.setMockInitialValues({
+        'grants_used_tonight': 2,
+        'granted_minutes_tonight': 40,
+        'grant_night': tonight,
+      });
+      final scheduler = makeScheduler();
+      await scheduler.restoreGrantState();
+      expect(scheduler.grantsUsedTonight, 2);
+      scheduler.dispose();
+    });
+  });
+
   group('fullUnlock', () {
     test('permanently unlocks and clears any selective allow-list', () {
       final scheduler = makeScheduler();

@@ -113,6 +113,24 @@ class MainActivity : FlutterActivity() {
                         }
                     }
 
+                    "pauseEnforcement" -> {
+                        // A full timed grant: suspend overlay enforcement until
+                        // the given epoch-ms while leaving the guardian running.
+                        val until = call.argument<Long>("untilEpochMs")
+                            ?: (call.argument<Int>("untilEpochMs")?.toLong() ?: 0L)
+                        SleepScheduleStore.setFullGrantPause(this, until)
+                        SleepGuardianService.evaluate(this, null)
+                        result.success(true)
+                    }
+
+                    "resumeEnforcement" -> {
+                        // Grant ended / expired: clear the pause and re-evaluate
+                        // so enforcement re-arms immediately if still locked.
+                        SleepScheduleStore.clearFullGrantPause(this)
+                        SleepGuardianService.evaluate(this, null)
+                        result.success(true)
+                    }
+
                     "listInstalledApps" -> result.success(listInstalledApps())
 
                     "deviceManufacturer" ->

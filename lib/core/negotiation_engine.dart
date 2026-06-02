@@ -365,21 +365,23 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   Future<GuardianDecision> _sendAnthropicToolUse(String userMessage) async {
     // History-shape invariant: if a tool_use is pending from the previous
     // assistant turn, the tool_result block comes FIRST in this user turn.
-    _anthropicHistory.add({
+    // Build the next user turn LOCALLY and do NOT mutate _anthropicHistory or
+    // clear _lastToolUseId / _pendingToolResultAck until the request has
+    // succeeded and parsed — otherwise a timeout / non-2xx / bad-JSON leaves the
+    // local session out of sync with the provider (a phantom user turn the API
+    // never saw, and a discarded pending tool_result).
+    final nextUserTurn = <String, dynamic>{
       'role': 'user',
       'content': buildUserTurnContent(
         userMessage: userMessage,
         pendingToolUseId: _lastToolUseId,
         toolResultAck: _pendingToolResultAck,
       ),
-    });
-    _lastToolUseId = null;
-    // Reset to the generic ack; only adjust_schedule re-sets it below.
-    _pendingToolResultAck = 'noted.';
+    };
 
     final body = buildAnthropicToolRequest(
       systemPrompt: _systemPrompt ?? '',
-      messages: _anthropicHistory,
+      messages: [..._anthropicHistory, nextUserTurn],
     );
 
     http.Response response;
@@ -434,10 +436,14 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       );
     }
 
-    // Append the assistant content (incl. the tool_use block) to history and
-    // track the tool_use_id for the next turn's tool_result.
+    // Success: NOW commit the user turn + assistant content (incl. the tool_use
+    // block) to history and track the tool_use_id for the next turn's
+    // tool_result. _pendingToolResultAck resets to the generic ack here; only
+    // adjust_schedule re-sets it below.
+    _anthropicHistory.add(nextUserTurn);
     _anthropicHistory.add({'role': 'assistant', 'content': content});
     _lastToolUseId = toolUse['id'] as String?;
+    _pendingToolResultAck = 'noted.';
 
     final toolName = toolUse['name'] as String? ?? '';
     final input = (toolUse['input'] as Map?)?.cast<String, dynamic>() ??

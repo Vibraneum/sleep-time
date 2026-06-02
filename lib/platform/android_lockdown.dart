@@ -339,25 +339,49 @@ class AndroidLockdown {
       if (kDebugMode) debugPrint('[sleep-time] simulate: android lockdown OFF');
       return;
     }
+    // Clear any full-grant enforcement pause so a later re-lock starts clean.
+    await resumeEnforcement();
     await stopGuardian();
   }
 
-  /// Grant temporary extension. With the M4 backstop the guardian keeps
-  /// running (it owns the schedule); the in-app UI handles the actual grant.
-  /// In M5 this will relax native blocking; for now it is a no-op beyond the
-  /// safe-mode log so the existing call site keeps working.
-  static Future<void> grantExtension() async {
+  /// Grant a FULL timed extension: the guardian keeps running (it owns the
+  /// schedule) but native overlay enforcement is SUSPENDED until [untilEpochMs]
+  /// so the whole device is usable for the grant. The pause auto-expires by wall
+  /// clock; [deactivate]/[relock] also clear it. Safe-mode is a no-op.
+  static Future<void> grantExtension({int? untilEpochMs}) async {
     if (!Platform.isAndroid) return;
     if (_simulating) {
       if (kDebugMode) debugPrint('[sleep-time] simulate: android grant');
       return;
     }
-    // Guardian stays armed; alarms will re-lock at the next transition.
+    if (untilEpochMs == null || untilEpochMs <= 0) {
+      // No duration to honor — leave the guardian fully armed.
+      return;
+    }
+    try {
+      await _channel
+          .invokeMethod('pauseEnforcement', {'untilEpochMs': untilEpochMs});
+    } on MissingPluginException {
+      // ignore
+    } catch (_) {}
   }
 
-  /// Re-lock after an extension expires — re-activate.
+  /// Resume native enforcement after a full grant ends/expires.
+  static Future<void> resumeEnforcement() async {
+    if (!Platform.isAndroid) return;
+    if (_simulating) return;
+    try {
+      await _channel.invokeMethod('resumeEnforcement');
+    } on MissingPluginException {
+      // ignore
+    } catch (_) {}
+  }
+
+  /// Re-lock after an extension expires — clear any full-grant pause and
+  /// re-activate so the overlay re-arms.
   static Future<void> relock() async {
     if (!Platform.isAndroid) return;
+    await resumeEnforcement();
     _isLocked = false;
     await activate();
   }

@@ -57,8 +57,10 @@ class WindowsLockState {
       }
     }
     return WindowsLockState(
+      // Clamp to the IPC-supported values only: a corrupt/stale lock.json must
+      // not push an unsupported mode through to the C++ side.
       locked: raw['locked'] == true,
-      mode: raw['mode'] is String ? raw['mode'] as String : 'full',
+      mode: raw['mode'] == 'grant' ? 'grant' : 'full',
       allow: allow,
       grantExpiryEpochMs:
           raw['grantExpiryEpochMs'] is num ? (raw['grantExpiryEpochMs'] as num).toInt() : 0,

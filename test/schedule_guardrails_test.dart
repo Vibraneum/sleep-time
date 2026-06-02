@@ -28,6 +28,15 @@ void main() {
     );
   }
 
+  group('unknown field fails closed', () {
+    test('rejects an unrecognized field instead of coercing to lockdown', () {
+      final d = check(field: 'bogus', hour: 23, minute: 45);
+      expect(d.outcome, GuardrailOutcome.rejected);
+      expect(d.applied, baseline,
+          reason: 'a malformed field must leave the schedule unchanged');
+    });
+  });
+
   group('per-nudge ±60 from baseline', () {
     test('grants a lockdown move within 60 min (23:30 -> 00:00, +30)', () {
       final d = check(field: 'lockdown', hour: 0, minute: 0);

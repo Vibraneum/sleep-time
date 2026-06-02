@@ -86,13 +86,16 @@ class NegotiableAppStore {
     for (final a in _apps) {
       if (a.label.toLowerCase() == lower) return a;
     }
-    // Loose contains match as a last resort (e.g. "youtube" → "YouTube").
-    for (final a in _apps) {
-      if (a.label.toLowerCase().contains(lower) ||
-          a.package.toLowerCase().contains(lower)) {
-        return a;
-      }
-    }
+    // Loose contains match as a last resort (e.g. "youtube" → "YouTube"). This
+    // gates a privileged unlock, so an AMBIGUOUS match (e.g. "youtube" matching
+    // both "YouTube" and "YouTube Music") must resolve to null rather than
+    // silently picking whichever happens to be first.
+    final matches = _apps
+        .where((a) =>
+            a.label.toLowerCase().contains(lower) ||
+            a.package.toLowerCase().contains(lower))
+        .toList(growable: false);
+    if (matches.length == 1) return matches.single;
     return null;
   }
 

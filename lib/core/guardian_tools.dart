@@ -4,7 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import 'config.dart';
 import 'negotiation_engine.dart' show GuardianAction, GuardianDecision;
-import 'schedule_guardrails.dart' show ScheduleScope;
+import 'schedule_guardrails.dart' show ScheduleGuardrails, ScheduleScope;
 
 /// The Anthropic Messages tool-use toolset for the guardian, plus strict
 /// mapping from a tool_use block to a [GuardianDecision].
@@ -208,6 +208,21 @@ GuardianDecision guardianDecisionFromToolUse(
       }
       final hour = (input['hour'] as num?)?.toInt();
       final minute = (input['minute'] as num?)?.toInt();
+      final reason = input['reason'];
+      // Fail CLOSED on malformed input: an unknown field, out-of-range or
+      // missing hour/minute, or an empty reason must collapse to deny rather
+      // than push invalid state downstream into the guardrails/store.
+      if (!ScheduleGuardrails.validFields.contains(field) ||
+          hour == null ||
+          hour < 0 ||
+          hour > 23 ||
+          minute == null ||
+          minute < 0 ||
+          minute > 59 ||
+          reason is! String ||
+          reason.trim().isEmpty) {
+        return _denyFallback();
+      }
       // Default to tonight when scope is absent — a tonight nudge is the
       // mostly-revertible, lower-stakes option.
       final scope = (input['scope'] as String?)?.toLowerCase() == 'permanent'
@@ -219,7 +234,7 @@ GuardianDecision guardianDecisionFromToolUse(
         scheduleField: field,
         scheduleHour: hour,
         scheduleMinute: minute,
-        scheduleReason: input['reason'] as String?,
+        scheduleReason: reason,
         scheduleScope: scope,
       );
     case 'end_session':

@@ -83,8 +83,13 @@ class _HomeScreenState extends State<HomeScreen> {
         // onSelectiveGrant → grantSelective; only a FULL grant fully restores.
         if (!_scheduler.isSelectiveGrant) {
           await WindowsLockdown.grantExtension();
+          // Full grant: suspend Android native enforcement until the grant
+          // expires so non-allowlisted apps aren't still blocked (#8). A
+          // selective grant instead uses the native allow-list path.
+          await AndroidLockdown.grantExtension(
+            untilEpochMs: _scheduler.grantExpiry?.millisecondsSinceEpoch,
+          );
         }
-        await AndroidLockdown.grantExtension();
         break;
       case LockdownState.unlocked:
       case LockdownState.awake:

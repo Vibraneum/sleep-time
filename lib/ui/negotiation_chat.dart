@@ -81,9 +81,12 @@ class _NegotiationChatState extends State<NegotiationChat> {
 
   Future<void> _sendMessage() async {
     final text = _controller.text.trim();
-    if (text.isEmpty || _isLoading || _negotiationOver) return;
+    if (text.isEmpty) return;
 
-    // Safe word check — shut the app down completely
+    // Safe word check — shut the app down completely. This MUST fire regardless
+    // of loading / negotiation-over state: a safety escape that gets silently
+    // dropped because a model call is in flight (_isLoading) is unacceptable.
+    // So it sits ABOVE the loading/over guard below.
     if (AppConfig.safeWord.isNotEmpty &&
         text.toLowerCase() == AppConfig.safeWord.toLowerCase()) {
       _controller.clear();
@@ -94,12 +97,15 @@ class _NegotiationChatState extends State<NegotiationChat> {
           isUser: false,
         ));
         _negotiationOver = true;
+        _isLoading = false;
       });
       _scrollToBottom();
       await Future.delayed(const Duration(seconds: 1));
       widget.onClose?.call();
       return;
     }
+
+    if (_isLoading || _negotiationOver) return;
 
     _controller.clear();
     setState(() {

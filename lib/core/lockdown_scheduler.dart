@@ -69,6 +69,17 @@ class LockdownScheduler {
   static const _grantedMinutesKey = 'granted_minutes_tonight';
   static const _grantAllowKey = 'grant_allow_images';
 
+  /// The lockdown-night (yyyy-MM-dd of the lockdown START) the persisted
+  /// counters belong to. Used on restore to discard yesterday's counters so a
+  /// relaunch the next day doesn't carry stale nightly caps into tonight.
+  static const _grantNightKey = 'grant_night';
+
+  /// The lockdown-night date string for [now] — the date of the lockdown START
+  /// that [now] falls under. Pure so it can be unit-tested.
+  @visibleForTesting
+  static String nightKeyFor(DateTime now) =>
+      AppConfig.lockdownStartForDate(now).toIso8601String().split('T')[0];
+
   LockdownState get state => _state;
   int get grantsUsedTonight => _grantsUsedTonight;
   DateTime? get grantExpiry => _grantExpiry;
@@ -91,14 +102,19 @@ class LockdownScheduler {
   }
 
   void start() {
-    // Restore any in-flight grant from a previous run before the first tick.
-    unawaited(restoreGrantState());
     // React to live schedule edits (human or guardian) immediately so a change
-    // takes effect without waiting for the next 15s tick.
+    // takes effect without waiting for the next 15s tick. Registered before
+    // restoration so a schedule change during restore is never missed.
     ScheduleStore.instance.addListener(_onScheduleChanged);
-    // Defer first update so it doesn't fire during initState/build
-    Timer(Duration.zero, _updateState);
-    _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _updateState());
+    // Gate the FIRST _updateState() and the periodic ticker on grant
+    // restoration completing. Otherwise the deferred first update could emit
+    // locked/unlocked before an in-flight grant restores (restart flicker /
+    // wrong re-lock).
+    restoreGrantState().then((_) {
+      _updateState();
+      _ticker =
+          Timer.periodic(const Duration(seconds: 15), (_) => _updateState());
+    });
   }
 
   void _onScheduleChanged() => _updateState();
@@ -127,6 +143,9 @@ class LockdownScheduler {
       }
       await prefs.setInt(_grantsUsedKey, _grantsUsedTonight);
       await prefs.setInt(_grantedMinutesKey, _grantedMinutesTonight);
+      // Stamp the night these counters belong to so a next-day relaunch can
+      // detect + discard stale counters.
+      await prefs.setString(_grantNightKey, nightKeyFor(DateTime.now()));
     } catch (_) {}
   }
 
@@ -136,6 +155,21 @@ class LockdownScheduler {
   Future<void> restoreGrantState() async {
     try {
       final prefs = await SharedPreferences.getInstance();
+      // Only carry counters forward if they belong to TONIGHT's lockdown. After
+      // a next-day relaunch (grant already expired) stale counters would wrongly
+      // constrain tonight's caps, so reset them and drop the stored grant.
+      final storedNight = prefs.getString(_grantNightKey);
+      final currentNight = nightKeyFor(DateTime.now());
+      if (storedNight != null && storedNight != currentNight) {
+        _grantsUsedTonight = 0;
+        _grantedMinutesTonight = 0;
+        await prefs.remove(_grantsUsedKey);
+        await prefs.remove(_grantedMinutesKey);
+        await prefs.remove(_grantExpiryKey);
+        await prefs.remove(_grantAllowKey);
+        await prefs.remove(_grantNightKey);
+        return;
+      }
       _grantsUsedTonight = prefs.getInt(_grantsUsedKey) ?? 0;
       _grantedMinutesTonight = prefs.getInt(_grantedMinutesKey) ?? 0;
       final expiryMs = prefs.getInt(_grantExpiryKey);
@@ -275,6 +309,25 @@ class LockdownScheduler {
     if (AppConfig.isWindDownTime(now)) return LockdownState.windDown;
     if (AppConfig.isAwakeTime(now)) return LockdownState.awake;
     return LockdownState.unlocked;
+  }
+
+  /// End an active grant EARLY ("back to sleep early") without permanently
+  /// unlocking. Cancels the grant (timer + expiry + allow-list), persists, and
+  /// recomputes the state so we fall back to `locked` (respecting `_manualLock`
+  /// / the schedule). Unlike [fullUnlock] this NEVER sets `_permanentlyUnlocked`
+  /// — the user is voluntarily returning to lockdown, so the takeover must
+  /// re-arm. No-op if there's no active grant.
+  void endGrantEarly() {
+    if (_grantExpiry == null) return;
+    _grantTimer?.cancel();
+    _grantTimer = null;
+    _grantExpiry = null;
+    _grantAllow = const [];
+    unawaited(_persistGrantState());
+    // Recompute: with the grant cleared this returns to locked (manual lock or
+    // schedule) or unlocked if we're genuinely outside lockdown hours. It does
+    // NOT set _permanentlyUnlocked, so onStateChange re-arms the takeover.
+    _updateState();
   }
 
   /// Fully unlock for the rest of the night — no timer, no re-lock.

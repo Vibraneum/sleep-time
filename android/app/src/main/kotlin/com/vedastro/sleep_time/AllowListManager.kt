@@ -28,6 +28,11 @@ object AllowListManager {
     private const val PREFS_NAME = "FlutterSharedPreferences"
     private const val KEY = "flutter.app_allowlist"
 
+    // Serializes read-modify-write of the persisted blob so concurrent allow()/
+    // purgeExpired() calls (activity vs service threads) cannot clobber each
+    // other and silently drop grants.
+    private val lock = Any()
+
     private fun prefs(context: Context): SharedPreferences =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
@@ -62,24 +67,28 @@ object AllowListManager {
     /** Add/refresh a time-limited grant for [pkg]. [minutes] is clamped >= 1. */
     fun allow(context: Context, pkg: String, label: String, minutes: Int) {
         if (pkg.isEmpty()) return
-        val safeMinutes = minutes.coerceAtLeast(1)
-        val expiresAt = System.currentTimeMillis() + safeMinutes * 60_000L
-        val current = readAll(context).toMutableList()
-        current.removeAll { it.identifier == pkg }
-        current.add(Entry(pkg, label.ifEmpty { pkg }, expiresAt))
-        writeAll(context, current)
+        synchronized(lock) {
+            val safeMinutes = minutes.coerceAtLeast(1)
+            val expiresAt = System.currentTimeMillis() + safeMinutes * 60_000L
+            val current = readAll(context).toMutableList()
+            current.removeAll { it.identifier == pkg }
+            current.add(Entry(pkg, label.ifEmpty { pkg }, expiresAt))
+            writeAll(context, current)
+        }
     }
 
     /** Drop expired entries; returns true if anything changed. */
     fun purgeExpired(context: Context): Boolean {
-        val now = System.currentTimeMillis()
-        val all = readAll(context)
-        val kept = all.filter { it.isActive(now) }
-        if (kept.size != all.size) {
-            writeAll(context, kept)
-            return true
+        synchronized(lock) {
+            val now = System.currentTimeMillis()
+            val all = readAll(context)
+            val kept = all.filter { it.isActive(now) }
+            if (kept.size != all.size) {
+                writeAll(context, kept)
+                return true
+            }
+            return false
         }
-        return false
     }
 
     /** Soonest expiry across active entries, or 0L when none. */

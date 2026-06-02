@@ -1,5 +1,6 @@
 #include "flutter_window.h"
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,6 +24,21 @@ bool IsLockActive() {
   return sleeplock::Read().locked;
 }
 
+// Current wall-clock time as Unix epoch milliseconds. Uses the system clock so
+// it can be compared against the persisted `grantExpiryEpochMs`.
+std::int64_t NowEpochMs() {
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  ULARGE_INTEGER li;
+  li.LowPart = ft.dwLowDateTime;
+  li.HighPart = ft.dwHighDateTime;
+  // FILETIME is 100-ns ticks since 1601-01-01; convert to ms and shift the
+  // epoch to 1970-01-01 (11644473600000 ms between the two epochs).
+  const std::int64_t kFiletimeEpochOffsetMs = 11644473600000LL;
+  return static_cast<std::int64_t>(li.QuadPart / 10000ULL) -
+         kFiletimeEpochOffsetMs;
+}
+
 // In grant mode, decide whether |hwnd| is an allowed foreground window we must
 // NOT snap away from. In full mode (or when not in grant), nothing foreign is
 // allowed. Our OWN window is always "allowed" so we never fight ourselves.
@@ -39,6 +55,14 @@ bool ShouldAllowForeground(HWND hwnd, HWND own_window) {
   }
   if (!state.mode_grant) {
     return false;  // full lock: everything foreign is disallowed
+  }
+  // Grant mode FAILS CLOSED on expiry: if Dart died or missed restoreFull(),
+  // the persisted grant must not outlive its promised duration. Treat a
+  // missing/zero/past expiry as expired and reclaim. (0 means the grant writer
+  // never set a duration, so it is unsafe to honor.)
+  if (state.grant_expiry_epoch_ms <= 0 ||
+      NowEpochMs() >= state.grant_expiry_epoch_ms) {
+    return false;
   }
   // Grant mode: resolve the owning process image. If we cannot resolve it (e.g.
   // a protected / elevated process) we fail SAFE and reclaim.

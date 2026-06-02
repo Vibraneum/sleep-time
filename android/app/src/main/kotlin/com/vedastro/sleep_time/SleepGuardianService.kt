@@ -178,8 +178,15 @@ class SleepGuardianService : Service() {
 
         updateNotification(state)
 
+        // A FULL timed grant suspends overlay enforcement until it expires: the
+        // schedule still says LOCKED, but the whole device is usable so the user
+        // can spend their earned time. (Selective per-app grants use the
+        // allow-list path inside handleForegroundApp instead and keep the
+        // overlay armed.) The pause auto-expires by wall clock.
+        val enforcementPaused = SleepScheduleStore.isEnforcementPaused(this)
+
         // M5 escalation. Honor safe mode: no overlay / watcher when simulating.
-        if (!simulating && state == STATE_LOCKED) {
+        if (!simulating && state == STATE_LOCKED && !enforcementPaused) {
             startEnforcement()
             // Re-evaluate the foreground immediately on each transition.
             val pkg = watcher?.latestForegroundPackage()
@@ -293,9 +300,15 @@ class SleepGuardianService : Service() {
     }
 
     private fun broadcastState(state: String) {
+        // Report the real grant expiry so the UI can distinguish an active grant
+        // (selective allow-list OR a full-grant enforcement pause) from "no
+        // grant". Use whichever is later.
+        val selectiveExpiry = AllowListManager.nextExpiryMillis(this)
+        val fullGrantExpiry = SleepScheduleStore.fullGrantPauseUntil(this)
+        val grantExpiresAt = maxOf(selectiveExpiry, fullGrantExpiry)
         val intent = Intent(BROADCAST_STATE).apply {
             putExtra(EXTRA_STATE, state)
-            putExtra(EXTRA_GRANT_EXPIRES_AT, 0L)
+            putExtra(EXTRA_GRANT_EXPIRES_AT, grantExpiresAt)
             putExtra(EXTRA_DEGRADED, SleepAlarmScheduler.isDegraded(this@SleepGuardianService))
         }
         LocalBroadcastManager.getInstance(this).sendBroadcast(intent)

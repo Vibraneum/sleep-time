@@ -50,6 +50,17 @@ class ScheduleStore extends ChangeNotifier {
   SleepSchedule _current = SleepSchedule.defaults;
   SleepSchedule _baseline = SleepSchedule.defaults;
 
+  /// Serializes all persistence so two rapid changes can't interleave their
+  /// `setInt` calls and leave SharedPreferences with mixed/stale values, and so
+  /// a listener (e.g. the Android native-reschedule in main) can AWAIT the
+  /// latest write completing before re-reading native prefs (#9).
+  Future<void> _persistQueue = Future.value();
+
+  /// Completes when all persistence enqueued SO FAR has finished. Listeners that
+  /// re-read the persisted schedule on a change (the Android setSchedule path)
+  /// should `await` this first so they never read a stale value.
+  Future<void> get persistenceSettled => _persistQueue;
+
   /// Fields changed by an `aiTonight` apply this night, so [revertTonightNudges]
   /// knows exactly which fields to roll back to baseline. Cleared on revert and
   /// on any userSettings/aiPermanent apply (those move the baseline).
@@ -159,7 +170,7 @@ class ScheduleStore extends ChangeNotifier {
     _lastChangeNote = reason;
 
     // Persist (fire-and-forget; swallow failures).
-    _persist(next);
+    _enqueuePersist(next);
 
     // Audit (fire-and-forget; swallow failures inside the service). Log the
     // structured changed-field with deterministic HH:MM old/new values so the
@@ -224,7 +235,7 @@ class ScheduleStore extends ChangeNotifier {
     _current = reverted;
     _lastChangeSource = ScheduleSource.system;
     _lastChangeNote = 'reverted tonight\'s nudges to baseline';
-    _persist(reverted);
+    _enqueuePersist(reverted);
     final changed = _changedField(previous, reverted);
     MemoryService.logScheduleChange(
       source: ScheduleSource.system.name,
@@ -272,6 +283,13 @@ class ScheduleStore extends ChangeNotifier {
 
   static String _hhmm(ScheduleTime t) =>
       '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
+  /// Chain a persist onto the serial queue so writes never interleave. The
+  /// queue absorbs failures so one bad write can't wedge later ones.
+  void _enqueuePersist(SleepSchedule schedule) {
+    _persistQueue =
+        _persistQueue.then((_) => _persist(schedule)).catchError((_) {});
+  }
 
   Future<void> _persist(SleepSchedule s) async {
     try {

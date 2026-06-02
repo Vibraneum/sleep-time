@@ -1,8 +1,24 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sleep_time/core/config.dart';
 import 'package:sleep_time/core/negotiation_engine.dart';
 import 'package:sleep_time/ui/negotiation_chat.dart';
+
+/// Engine whose [negotiate] never completes until the test releases it, so we
+/// can park the chat in its loading state (_isLoading == true) and prove the
+/// safe word still fires while a model call is in flight (#1).
+class _StuckEngine extends NegotiationEngine {
+  final Completer<GuardianDecision> gate = Completer<GuardianDecision>();
+  bool negotiateCalled = false;
+
+  @override
+  Future<GuardianDecision> negotiate(String userMessage) {
+    negotiateCalled = true;
+    return gate.future;
+  }
+}
 
 /// End-to-end widget coverage of the negotiation loop: a user types into the
 /// real chat UI, the engine returns a decision, and the screen dispatches the
@@ -91,6 +107,59 @@ void main() {
       await Future<void>.delayed(const Duration(milliseconds: 1200));
       await tester.pump();
       expect(closed, isTrue);
+    });
+  });
+
+  testWidgets(
+      '#1 safe word fires even while the guardian is thinking (loading)',
+      (tester) async {
+    await tester.runAsync(() async {
+      var closed = false;
+      final engine = _StuckEngine();
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: NegotiationChat(
+              engine: engine,
+              grantsUsedTonight: 0,
+              onGranted: (_) {},
+              onClose: () => closed = true,
+            ),
+          ),
+        ),
+      );
+      await settleGreeting(tester);
+
+      // Kick off a normal message: negotiate() hangs on the gate, parking the
+      // chat in its loading state (_isLoading == true).
+      await tester.enterText(find.byType(TextField), 'please five minutes');
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await tester.pump();
+      expect(engine.negotiateCalled, isTrue,
+          reason: 'first message should start an in-flight model call');
+      expect(closed, isFalse);
+
+      // Now type the safe word WHILE the call is still pending. Under the old
+      // `if (... || _isLoading) return;` guard this would be silently dropped.
+      await tester.enterText(find.byType(TextField), 'dontdie');
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      await tester.pump();
+      expect(find.textContaining('safe word'), findsOneWidget,
+          reason: 'safe word must be accepted even mid-call');
+
+      // onClose is deferred ~1s.
+      await Future<void>.delayed(const Duration(milliseconds: 1200));
+      await tester.pump();
+      expect(closed, isTrue,
+          reason: 'safe word must release regardless of loading state');
+
+      // Release the gate so the pending future does not dangle.
+      engine.gate.complete(GuardianDecision(
+        message: 'late',
+        action: GuardianAction.none,
+      ));
     });
   });
 }

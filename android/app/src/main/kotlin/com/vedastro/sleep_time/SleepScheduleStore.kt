@@ -39,10 +39,46 @@ object SleepScheduleStore {
     private const val DEFAULT_UNLOCK_HOUR = 6
     private const val DEFAULT_UNLOCK_MINUTE = 0
 
+    // Epoch-ms until which a FULL timed grant suspends overlay enforcement.
+    // 0 / past = no active full-grant pause. Stored in the same prefs file (not
+    // flutter-prefixed since only native reads/writes it) so it survives a
+    // service restart.
+    private const val GRANT_PAUSE_UNTIL_KEY = "guardian_full_grant_pause_until_ms"
+
     /** Whether the user/dev has the app in safe (simulate) mode. */
     fun isSimulating(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         return prefs.getBoolean(PREFIX + "simulate_lockdown", false)
+    }
+
+    /**
+     * Suspend overlay/foreground enforcement until [untilEpochMs] (a full timed
+     * grant). The schedule-derived state stays LOCKED, but [evaluate] skips the
+     * overlay so the whole device is usable for the grant duration. A value <=
+     * now (or 0) clears the pause.
+     */
+    fun setFullGrantPause(context: Context, untilEpochMs: Long) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putLong(GRANT_PAUSE_UNTIL_KEY, untilEpochMs)
+            .apply()
+    }
+
+    /** Clear any active full-grant enforcement pause. */
+    fun clearFullGrantPause(context: Context) = setFullGrantPause(context, 0L)
+
+    /** True while a full-grant enforcement pause is still in effect. */
+    fun isEnforcementPaused(context: Context): Boolean {
+        val until = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getLong(GRANT_PAUSE_UNTIL_KEY, 0L)
+        return until > System.currentTimeMillis()
+    }
+
+    /** Epoch-ms the active full-grant pause ends, or 0 when none/expired. */
+    fun fullGrantPauseUntil(context: Context): Long {
+        val until = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getLong(GRANT_PAUSE_UNTIL_KEY, 0L)
+        return if (until > System.currentTimeMillis()) until else 0L
     }
 
     fun read(context: Context): Schedule {

@@ -150,9 +150,13 @@ Future<void> main() async {
 Future<void> _initAndroidGuardian() async {
   if (!Platform.isAndroid) return;
 
-  // Keep native alarms in sync with in-app schedule edits.
+  // Keep native alarms in sync with in-app schedule edits. The native side
+  // re-reads FlutterSharedPreferences, so we must wait for ScheduleStore's
+  // persistence to land BEFORE signalling the recompute — otherwise native
+  // reschedules off the OLD schedule (#9).
   ScheduleStore.instance.addListener(() {
-    unawaited(AndroidLockdown.setSchedule());
+    unawaited(ScheduleStore.instance.persistenceSettled
+        .then((_) => AndroidLockdown.setSchedule()));
   });
 
   if (!_setupComplete || AppConfig.simulateLockdown) return;

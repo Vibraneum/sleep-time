@@ -15,10 +15,13 @@ enum OnboardingPermission {
 /// Pure gating logic for the Android permission onboarding, kept free of any
 /// widget/platform code so it can be unit-tested (see test/permission_gating_test.dart).
 ///
-/// Hard gates (block "continue" until granted): usage-access, overlay,
-/// exact-alarm. Optional (never block): accessibility, battery, notifications
-/// (a missing notification permission only weakens reminders; it must not trap
-/// the user in onboarding).
+/// Hard gates (block "continue" until granted): usage-access, overlay.
+/// Optional (never block): exact-alarm, accessibility, battery, notifications.
+/// Exact-alarm is RECOMMENDED, not required: the alarm scheduler has an
+/// idle-resilient inexact fallback (setAndAllowWhileIdle), so a denied/absent
+/// exact-alarm permission must not trap the user in onboarding or stop the
+/// guardian from starting. A missing notification permission only weakens
+/// reminders, so it does not block either.
 @immutable
 class PermissionGating {
   const PermissionGating._();
@@ -27,7 +30,6 @@ class PermissionGating {
   static const Set<OnboardingPermission> hardGates = {
     OnboardingPermission.overlay,
     OnboardingPermission.usageAccess,
-    OnboardingPermission.exactAlarm,
   };
 
   /// Whether [perm] is a hard gate.

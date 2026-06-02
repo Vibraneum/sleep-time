@@ -4,12 +4,17 @@ import 'package:sleep_time/platform/android_lockdown.dart';
 
 void main() {
   group('PermissionGating hard gates', () {
-    test('overlay, usageAccess, exactAlarm are hard gates', () {
+    test('overlay, usageAccess are hard gates', () {
       expect(PermissionGating.isHardGate(OnboardingPermission.overlay), isTrue);
       expect(
           PermissionGating.isHardGate(OnboardingPermission.usageAccess), isTrue);
-      expect(
-          PermissionGating.isHardGate(OnboardingPermission.exactAlarm), isTrue);
+    });
+
+    test('exactAlarm is NOT a hard gate (inexact fallback exists)', () {
+      // Exact-alarm denial must not trap the user in onboarding: the alarm
+      // scheduler has an idle-resilient inexact fallback.
+      expect(PermissionGating.isHardGate(OnboardingPermission.exactAlarm),
+          isFalse);
     });
 
     test('accessibility, battery, notifications are NOT hard gates', () {
@@ -24,9 +29,9 @@ void main() {
   group('PermissionGating.canFinish', () {
     test('false when any hard gate missing', () {
       const status = AndroidPermissionStatus(
-        overlay: true,
+        overlay: false, // missing hard gate
         usageAccess: true,
-        exactAlarm: false, // missing hard gate
+        exactAlarm: true,
         accessibility: true,
         batteryExemption: true,
         notifications: true,
@@ -34,12 +39,12 @@ void main() {
       expect(PermissionGating.canFinish(status), isFalse);
     });
 
-    test('true when all hard gates granted, regardless of optional ones', () {
+    test('true when hard gates granted even if exactAlarm is denied', () {
       const status = AndroidPermissionStatus(
         overlay: true,
         usageAccess: true,
-        exactAlarm: true,
-        // optional ones all false — must NOT block finishing
+        // exactAlarm denied — inexact fallback covers it, must NOT block.
+        exactAlarm: false,
         accessibility: false,
         batteryExemption: false,
         notifications: false,
@@ -55,7 +60,8 @@ void main() {
       );
       final missing = PermissionGating.missingHardGates(status);
       expect(missing, contains(OnboardingPermission.usageAccess));
-      expect(missing, contains(OnboardingPermission.exactAlarm));
+      // exactAlarm is no longer a hard gate, so it must NOT be listed.
+      expect(missing, isNot(contains(OnboardingPermission.exactAlarm)));
       expect(missing, isNot(contains(OnboardingPermission.overlay)));
     });
 

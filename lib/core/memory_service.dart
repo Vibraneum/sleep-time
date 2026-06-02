@@ -273,13 +273,14 @@ class MemoryService {
     final db = await _safeDb;
     if (db == null) return empty;
     try {
-      final tonight = DateTime.now().copyWith(
-        hour: 22,
-        minute: 0,
-        second: 0,
-        millisecond: 0,
-        microsecond: 0,
-      );
+      // Anchor "tonight" to the most recent 22:00 boundary. After midnight
+      // (00:00–21:59) that is YESTERDAY's 22:00, not today's — otherwise the
+      // edit-budget window collapses to nothing overnight and the cap reopens.
+      final now = DateTime.now();
+      var tonight = DateTime(now.year, now.month, now.day, 22);
+      if (now.isBefore(tonight)) {
+        tonight = tonight.subtract(const Duration(days: 1));
+      }
       final rows = await db.query(
         'schedule_changes',
         where: "timestamp > ? AND source IN ('aiTonight', 'aiPermanent') "

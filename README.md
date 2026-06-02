@@ -11,7 +11,7 @@ A bedtime enforcer for Windows. Locks your screen at a set time. An AI guardian 
 1. Go to [Releases](https://github.com/Vibraneum/sleep-time/releases/latest)
 2. Download `sleep-time-windows-setup-vX.X.X.exe` (installer) or the `.zip` (portable)
 3. Run the installer — Windows may show a SmartScreen warning since the app is unsigned; click **More info → Run anyway**
-4. On first launch, enter a [Gemini API key](https://aistudio.google.com/apikey) (free tier works)
+4. On first launch, open **Settings → AI Provider** and enter an API key for your chosen provider ([Anthropic](https://console.anthropic.com) recommended; [Gemini](https://aistudio.google.com/apikey) also supported)
 5. Set your sleep schedule in Settings and leave the app running
 
 That's it. The app sits in the background and locks the screen at your configured time.
