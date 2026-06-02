@@ -33,6 +33,12 @@ class LockdownScheduler {
   bool _permanentlyUnlocked = false;
   String? _lastSleepLogDate;
 
+  /// Manual "lock now" override (the home Test/Lock-now button). When true the
+  /// scheduler reports `locked` regardless of the clock, so the real platform
+  /// takeover engages on demand. Cleared by a full unlock (safe word /
+  /// end_session) and on the nightly reset.
+  bool _manualLock = false;
+
   /// The lockdown-start instant captured when we FIRST entered `locked` this
   /// night. Used by [_logSleepIfNeeded] instead of a fresh
   /// `lockdownStartForDate` so a mid-night schedule edit (which would move the
@@ -96,6 +102,15 @@ class LockdownScheduler {
   }
 
   void _onScheduleChanged() => _updateState();
+
+  /// Lock the device right now, independent of the schedule (manual "lock now" /
+  /// test affordance). Drives the real platform takeover via [onStateChange] →
+  /// the host's platform sync. Cleared by [fullUnlock] or the nightly reset.
+  void forceLock() {
+    _manualLock = true;
+    _permanentlyUnlocked = false;
+    _updateState();
+  }
 
   /// Persist the current grant state. Fire-and-forget; failures are swallowed
   /// to match the rest of the persistence layer.
@@ -225,6 +240,7 @@ class LockdownScheduler {
       _windDownNotified = false;
       _lockdownNotified = false;
       _activeLockdownStart = null;
+      _manualLock = false;
       // Roll back any tonight-only guardian nudges for the next night.
       ScheduleStore.instance.revertTonightNudges();
       unawaited(_persistGrantState());
@@ -251,6 +267,10 @@ class LockdownScheduler {
       return LockdownState.unlocked;
     }
 
+    // Manual lock-now overrides the clock so the takeover can be engaged/tested
+    // on demand. A grant (above) still wins so the user can always negotiate out.
+    if (_manualLock) return LockdownState.locked;
+
     if (AppConfig.isLockdownTime(now)) return LockdownState.locked;
     if (AppConfig.isWindDownTime(now)) return LockdownState.windDown;
     if (AppConfig.isAwakeTime(now)) return LockdownState.awake;
@@ -262,6 +282,7 @@ class LockdownScheduler {
     _grantTimer?.cancel();
     _grantExpiry = null;
     _grantAllow = const [];
+    _manualLock = false;
     _permanentlyUnlocked = true;
     _state = LockdownState.unlocked;
     onStateChange(_state);

@@ -123,4 +123,37 @@ void main() {
       scheduler.dispose();
     });
   });
+
+  group('forceLock', () {
+    test('locks immediately regardless of the clock', () {
+      var lastState = LockdownState.unlocked;
+      final scheduler = makeScheduler(onState: (s) => lastState = s);
+      scheduler.forceLock();
+
+      expect(scheduler.state, LockdownState.locked);
+      expect(lastState, LockdownState.locked);
+      scheduler.dispose();
+    });
+
+    test('the safe word (fullUnlock) clears the manual lock — escape works', () {
+      final scheduler = makeScheduler();
+      scheduler.forceLock();
+      expect(scheduler.state, LockdownState.locked);
+
+      scheduler.fullUnlock();
+      expect(scheduler.state, LockdownState.unlocked);
+      expect(scheduler.permanentlyUnlocked, isTrue);
+      scheduler.dispose();
+    });
+
+    test('a grant still wins over a manual lock so the user can negotiate out',
+        () {
+      final scheduler = makeScheduler();
+      scheduler.forceLock();
+      scheduler.grantExtension(5);
+
+      expect(scheduler.state, LockdownState.granted);
+      scheduler.dispose();
+    });
+  });
 }

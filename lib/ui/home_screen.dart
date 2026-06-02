@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:io';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/config.dart';
@@ -130,21 +129,27 @@ class _HomeScreenState extends State<HomeScreen> {
               _buildScheduleCard(),
               const SizedBox(height: 16),
               _buildStatsCard(),
-              if (kDebugMode) ...[
-                const SizedBox(height: 24),
-                Center(
-                  child: TextButton(
-                    onPressed: _showLockdownScreen,
-                    child: Text(
-                      'Test Lockdown',
-                      style: TextStyle(
-                        color: Colors.grey.shade400,
-                        fontSize: 12,
-                      ),
+              const SizedBox(height: 24),
+              Center(
+                // Manual "go to bed now": engages the REAL takeover immediately,
+                // independent of the schedule. forceLock() drives the scheduler
+                // into `locked`, firing _syncPlatformLockdown ->
+                // WindowsLockdown.activate() (fullscreen + always-on-top + key
+                // blocking + watchdog). The safe word / a grant releases it.
+                child: TextButton.icon(
+                  onPressed: () => _scheduler.forceLock(),
+                  icon: const Icon(Icons.nightlight_round,
+                      size: 16, color: Color(0xFF5B5FEF)),
+                  label: const Text(
+                    'Sleep now',
+                    style: TextStyle(
+                      color: Color(0xFF5B5FEF),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
-              ],
+              ),
             ],
           ),
         ),

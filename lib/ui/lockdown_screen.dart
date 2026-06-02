@@ -69,6 +69,21 @@ class _LockdownScreenState extends State<LockdownScreen>
       _grantedAppLabel = null;
       _showChat = false;
     });
+    // A full grant frees the whole machine — get out of the way automatically so
+    // the user can actually use their earned time (the platform takeover is
+    // already released by _syncPlatformLockdown on the `granted` transition).
+    _minimizeOutOfTheWay();
+  }
+
+  /// Send the window to the taskbar so the guardian keeps running in the
+  /// background without covering the screen. No-op in safe mode / off-Windows.
+  Future<void> _minimizeOutOfTheWay() async {
+    if (AppConfig.simulateLockdown || !Platform.isWindows) return;
+    try {
+      await windowManager.setAlwaysOnTop(false);
+      await windowManager.setFullScreen(false);
+      await windowManager.minimize();
+    } catch (_) {}
   }
 
   Future<void> _onMinimize(int minutes) async {
@@ -157,26 +172,28 @@ class _LockdownScreenState extends State<LockdownScreen>
     });
   }
 
+  /// Safe word + guardian `close`. Releases the lockdown fully and gets the app
+  /// OUT OF THE WAY — but keeps it running in the background so it can still
+  /// enforce future nights (a sleep guardian that quits is useless). The safe
+  /// word must always reach here: fullUnlock clears the manual lock + grants and
+  /// deactivate() tears down the platform takeover (fullscreen / always-on-top /
+  /// key hook / watchdog).
   Future<void> _onClose() async {
     widget.scheduler.fullUnlock();
     await WindowsLockdown.deactivate();
-    // In simulate mode (or on mobile) just return to the home screen instead
-    // of killing the process — closing makes no sense in dev / on Android.
-    if (AppConfig.simulateLockdown || !Platform.isWindows) {
-      if (mounted) {
-        Navigator.of(context).pushAndRemoveUntil(
-          MaterialPageRoute(builder: (_) => const HomeScreen()),
-          (_) => false,
-        );
-      }
-      return;
+    if (Platform.isWindows && !AppConfig.simulateLockdown) {
+      try {
+        await windowManager.setPreventClose(false);
+      } catch (_) {}
     }
-    try {
-      await windowManager.setPreventClose(false);
-      await windowManager.destroy();
-    } catch (_) {
-      exit(0);
+    if (mounted) {
+      Navigator.of(context).pushAndRemoveUntil(
+        MaterialPageRoute(builder: (_) => const HomeScreen()),
+        (_) => false,
+      );
     }
+    // Drop to the taskbar so the guardian stays alive without covering the screen.
+    await _minimizeOutOfTheWay();
   }
 
   void _onUnlock() {
