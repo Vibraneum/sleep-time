@@ -53,7 +53,9 @@ void main() {
       expect(body['tool_choice'], {'type': 'auto'});
       expect(body['thinking'], {'type': 'adaptive'});
       expect((body['output_config'] as Map)['effort'], 'low');
-      expect(body['disable_parallel_tool_use'], isTrue);
+      // disable_parallel_tool_use is REJECTED by the API when thinking is on
+      // ("Extra inputs are not permitted") — it must be OMITTED here.
+      expect(body.containsKey('disable_parallel_tool_use'), isFalse);
       // Thinking needs headroom.
       expect(body['max_tokens'] as int, greaterThanOrEqualTo(4096));
       // Sampling params 400 with thinking enabled — temperature must be omitted.

@@ -186,9 +186,17 @@ Map<String, dynamic> buildAnthropicToolRequest({
     // Thinking is incompatible with forced tool use: `any`/`tool` returns 400
     // when thinking is enabled. So use `auto` when thinking is on, `any` off.
     'tool_choice': thinkingOn ? {'type': 'auto'} : {'type': 'any'},
-    'disable_parallel_tool_use': true,
     'messages': messages,
   };
+
+  // `disable_parallel_tool_use` is REJECTED ("Extra inputs are not permitted")
+  // when `thinking` is enabled — verified against the live API. With thinking on
+  // we use tool_choice:auto and the model makes a single tool call anyway, so we
+  // simply omit the flag in that case. When thinking is off we keep it to force
+  // exactly one tool call per turn.
+  if (!thinkingOn) {
+    body['disable_parallel_tool_use'] = true;
+  }
 
   if (thinkingOn) {
     body['thinking'] = {'type': 'adaptive'};
