@@ -32,18 +32,22 @@ void main() {
       expect(AppConfig.defaultAnthropicModel, 'claude-sonnet-4-6');
     });
 
-    test('cache_control on the LAST system block and the LAST tool', () {
+    test('cache_control (1h TTL) on the LAST system block and the LAST tool',
+        () {
       final body = buildAnthropicToolRequest(
         systemPrompt: 'you are the guardian.',
         messages: const [],
       );
 
       final system = body['system'] as List<dynamic>;
-      expect((system.last as Map)['cache_control'], {'type': 'ephemeral'});
+      // 1h TTL (GA) keeps system+tools cached across a whole bedtime session.
+      expect((system.last as Map)['cache_control'],
+          {'type': 'ephemeral', 'ttl': '1h'});
 
       final tools = body['tools'] as List<dynamic>;
-      // Only the last tool carries cache_control.
-      expect((tools.last as Map)['cache_control'], {'type': 'ephemeral'});
+      // Only the last tool carries cache_control, and it carries the 1h TTL too.
+      expect((tools.last as Map)['cache_control'],
+          {'type': 'ephemeral', 'ttl': '1h'});
       for (final t in tools.take(tools.length - 1)) {
         expect((t as Map).containsKey('cache_control'), isFalse);
       }

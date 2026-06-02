@@ -54,6 +54,22 @@ void main() {
       expect(input['message'], 'no. sleep.');
     });
 
+    test('captures a refusal stop_reason (no tool block emitted)', () {
+      // On a refusal the model emits no tool_use; the engine reads
+      // acc.stopReason == "refusal" to return a safe in-character deny rather
+      // than trying to parse an absent tool block.
+      final acc = newAcc();
+      acc.handleEvent('message_start', {'message': {}});
+      acc.handleEvent('message_delta', {
+        'delta': {'stop_reason': 'refusal'},
+      });
+      acc.handleEvent('message_stop', {});
+
+      expect(acc.stopReason, 'refusal');
+      expect(acc.toolName, isNull);
+      expect(acc.toolInputJson, isEmpty);
+    });
+
     test('emits progressive message snapshots only when the message changes',
         () {
       final acc = newAcc();

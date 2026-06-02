@@ -70,6 +70,12 @@ class _ChatMessage {
   /// (once text is flowing). Cleared when the bubble is finalized.
   bool streaming;
 
+  /// True when this is a degraded "guardian unreachable" reply (the engine
+  /// flagged the decision offline after retries). Renders amber with a retry
+  /// hint so it never reads as a real, cruel-sounding refusal. Set via cascade
+  /// when the bubble is finalized, so it isn't a constructor argument.
+  bool offline = false;
+
   _ChatMessage({
     required this.text,
     required this.isUser,
@@ -309,6 +315,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
         bubble
           ..text = decision.message
           ..scheduleNote = decision.scheduleOutcomeNote
+          ..offline = decision.offline
           ..streaming = false;
         _streamingBubble = null;
         _isLoading = false;
@@ -379,15 +386,29 @@ class _NegotiationChatState extends State<NegotiationChat> {
     if (!_negotiationOver) _focusNode.requestFocus();
   }
 
-  /// Track consecutive offline / missing-key replies. The engine returns a
-  /// `deny`-action bubble with one of its canned offline lines when it cannot
-  /// reach the model; after [_offlineReleaseThreshold] in a row we offer a
-  /// graceful degraded release so a no-key user isn't trapped (the only other
-  /// escape being the safe word).
+  /// Track consecutive offline / missing-key replies. The engine now flags
+  /// degraded results with typed signals: [GuardianDecision.authFailure] (key
+  /// missing or rejected) and [GuardianDecision.offline] (unreachable after
+  /// retries). After [_offlineReleaseThreshold] in a row we offer a graceful
+  /// degraded release so a stuck user isn't trapped (the only other escape
+  /// being the safe word). A clean (non-degraded) reply resets the streak.
   void _trackOfflineStreak(GuardianDecision decision) {
-    final looksOffline = !AppConfig.hasUsableAiKey ||
-        decision.message == 'guardian is offline. try again.' ||
-        decision.message == 'something broke. try again.';
+    // An auth failure routes straight to the settings / missing-key banner — it
+    // is a configuration problem, not a transient outage, so surface it now.
+    if (decision.authFailure) {
+      if (!_degradedReleaseOffered) {
+        _degradedReleaseOffered = true;
+        _messages.add(_ChatMessage(
+          text: 'guardian offline — your API key is missing or rejected. '
+              'fix it in settings, or release the lockdown for now.',
+          isUser: false,
+          isSystem: true,
+        ));
+      }
+      return;
+    }
+
+    final looksOffline = !AppConfig.hasUsableAiKey || decision.offline;
     if (looksOffline) {
       _offlineStreak++;
     } else {
@@ -630,14 +651,23 @@ class _NegotiationChatState extends State<NegotiationChat> {
                   decoration: BoxDecoration(
                     color: msg.isUser
                         ? const Color(0xFF5B5FEF).withAlpha(40)
-                        : Colors.white.withAlpha(10),
+                        : msg.offline
+                            ? const Color(0xFFFF9500).withAlpha(28)
+                            : Colors.white.withAlpha(10),
                     borderRadius: BorderRadius.circular(16),
+                    border: msg.offline
+                        ? Border.all(color: const Color(0xFFFF9500).withAlpha(70))
+                        : null,
                   ),
                   child: _bubbleContent(msg),
                 ),
                 if (msg.scheduleNote != null) ...[
                   const SizedBox(height: 6),
                   _scheduleNoteChip(msg.scheduleNote!),
+                ],
+                if (msg.offline) ...[
+                  const SizedBox(height: 6),
+                  _offlineRetryHint(),
                 ],
               ],
             ),
@@ -708,6 +738,26 @@ class _NegotiationChatState extends State<NegotiationChat> {
           ),
         ],
       ),
+    );
+  }
+
+  /// A small amber hint beneath an offline guardian bubble. Reassures the user
+  /// the deny is a transient outage, not a real refusal, and points at the
+  /// recovery affordances (retry / safe word).
+  Widget _offlineRetryHint() {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const Icon(Icons.cloud_off_rounded, size: 13, color: Color(0xFFFFB95E)),
+        const SizedBox(width: 6),
+        Text(
+          'guardian unreachable — send again, or use your safe word',
+          style: TextStyle(
+            color: const Color(0xFFFFB95E).withAlpha(220),
+            fontSize: 12,
+          ),
+        ),
+      ],
     );
   }
 

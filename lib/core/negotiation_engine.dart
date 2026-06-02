@@ -5,6 +5,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:http/http.dart' as http;
 
+import 'anthropic_retry.dart';
 import 'anthropic_stream.dart';
 import 'config.dart';
 import 'guardian_tools.dart';
@@ -64,6 +65,18 @@ class GuardianDecision {
   /// tonight") the UI can render as a chip. Null when no schedule change ran.
   final String? scheduleOutcomeNote;
 
+  /// True when this decision is a degraded result because the guardian could
+  /// not reach its brain (rate-limit / overloaded / server / network, AFTER
+  /// retries were exhausted). The UI styles these amber with a retry
+  /// affordance — "guardian unreachable, try again / use the safe word" — and
+  /// must NOT treat the (deny) action as a real, cruel-sounding refusal.
+  final bool offline;
+
+  /// True when this decision is a degraded result because the API key is
+  /// missing or rejected (401/403). The UI routes these to the settings /
+  /// missing-key path rather than showing a generic deny.
+  final bool authFailure;
+
   GuardianDecision({
     required this.message,
     this.action = GuardianAction.none,
@@ -81,6 +94,8 @@ class GuardianDecision {
     this.scheduleReason,
     this.scheduleScope,
     this.scheduleOutcomeNote,
+    this.offline = false,
+    this.authFailure = false,
   });
 
   /// Copy helper used by the engine to stamp the post-guardrail outcome note
@@ -102,6 +117,8 @@ class GuardianDecision {
         scheduleReason: scheduleReason,
         scheduleScope: scheduleScope,
         scheduleOutcomeNote: note,
+        offline: offline,
+        authFailure: authFailure,
       );
 
   bool get granted => action == GuardianAction.grant;
@@ -124,21 +141,25 @@ Map<String, dynamic> buildAnthropicToolRequest({
   int maxTokens = 500,
   double temperature = 0.7,
 }) {
-  // System as an array of blocks; cache_control on the LAST block.
+  // System as an array of blocks; cache_control on the LAST block. The 1h TTL
+  // (GA) keeps the system+tools prefix cached across a whole bedtime session —
+  // negotiation can span hours with long idle gaps, so 5m would expire between
+  // turns and re-pay the write each time.
   final system = <Map<String, dynamic>>[
     {
       'type': 'text',
       'text': systemPrompt,
-      'cache_control': {'type': 'ephemeral'},
+      'cache_control': {'type': 'ephemeral', 'ttl': '1h'},
     },
   ];
 
   // Deep-copy the tool maps so we can stamp cache_control on the last tool
-  // without mutating the shared const definitions.
+  // without mutating the shared const definitions. Same 1h TTL as the system
+  // block so tools + system cache together for the session.
   final tools = GuardianTools.all
       .map((tool) => jsonDecode(jsonEncode(tool)) as Map<String, dynamic>)
       .toList();
-  tools.last['cache_control'] = {'type': 'ephemeral'};
+  tools.last['cache_control'] = {'type': 'ephemeral', 'ttl': '1h'};
 
   return {
     'model': AppConfig.anthropicModel,
@@ -331,6 +352,9 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         messages: const [
           {'role': 'user', 'content': 'warmup'},
         ],
+        // max_tokens MUST be >=1 here: the API rejects max_tokens:0 together
+        // with tool_choice:{type:'any'} (400), and this request always carries
+        // tool_choice:any. 1 token of prefill is enough to write the cache.
         maxTokens: 1,
       );
       await http
@@ -523,6 +547,83 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         'anthropic-version': '2023-06-01',
       };
 
+  /// Degraded result when the guardian cannot reach its brain after retries
+  /// (rate-limit / overloaded / server / network). NOT a real refusal — flagged
+  /// `offline` so the UI shows an amber, retryable "unreachable" state. Rendered
+  /// as a deny so the chat stays live (the user can retry or use the safe word).
+  static GuardianDecision _offlineResult() => GuardianDecision(
+        message:
+            "can't reach the guardian right now. try again in a moment — or use your safe word.",
+        action: GuardianAction.deny,
+        offline: true,
+      );
+
+  /// Degraded result when the API key is missing or rejected (401/403). Routes
+  /// the user to the settings / missing-key path rather than a generic deny.
+  GuardianDecision _authFailureResult() => GuardianDecision(
+        message: _missingKeyMessage(),
+        action: GuardianAction.deny,
+        authFailure: true,
+      );
+
+  /// Single-shot POST with classification metadata. Returns the response (when
+  /// the request completed) plus the thrown error (when it did not) so the
+  /// retry loop can classify without re-catching. Never throws.
+  Future<({http.Response? response, Object? error})> _postAnthropicOnce(
+    Map<String, dynamic> body,
+  ) async {
+    try {
+      final response = await http
+          .post(
+            Uri.parse('https://api.anthropic.com/v1/messages'),
+            headers: _anthropicHeaders(),
+            body: jsonEncode(body),
+          )
+          .timeout(const Duration(seconds: 30));
+      return (response: response, error: null);
+    } catch (e) {
+      return (response: null, error: e);
+    }
+  }
+
+  /// Non-streaming POST WITH retry: exponential backoff + jitter on 429/500/529
+  /// and transport failures (max 3 retries), honoring a 429 `Retry-After`.
+  /// Returns the successful [http.Response], or null when the outcome was a
+  /// non-retryable error or retries were exhausted — with [outClass] carrying
+  /// the final classification so the caller can route auth vs offline.
+  Future<http.Response?> _postAnthropicWithRetry(
+    Map<String, dynamic> body, {
+    required void Function(AnthropicErrorClass cls) onClass,
+    BackoffConfig config = const BackoffConfig(),
+  }) async {
+    AnthropicErrorClass cls = AnthropicErrorClass.retryable;
+    for (var attempt = 0; attempt <= config.maxRetries; attempt++) {
+      final result = await _postAnthropicOnce(body);
+      final response = result.response;
+      final status = response?.statusCode;
+      cls = classifyAnthropic(status, result.error);
+
+      if (cls == AnthropicErrorClass.ok) {
+        onClass(cls);
+        return response;
+      }
+      // Non-retryable (auth / client error): surface immediately.
+      if (cls != AnthropicErrorClass.retryable) {
+        onClass(cls);
+        return null;
+      }
+      // Retryable. If this was the last allowed attempt, give up.
+      if (attempt == config.maxRetries) break;
+      final retryAfter =
+          status == 429 ? parseRetryAfter(response?.headers) : null;
+      await Future<void>.delayed(
+        backoffDelay(attempt, retryAfter: retryAfter, config: config),
+      );
+    }
+    onClass(cls);
+    return null;
+  }
+
   /// Build the next Anthropic user turn LOCALLY (without mutating
   /// _anthropicHistory). History-shape invariant: if a tool_use is pending from
   /// the previous assistant turn, the tool_result block comes FIRST in this
@@ -587,6 +688,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   }
 
   Future<GuardianDecision> _sendAnthropicToolUse(String userMessage) async {
+    // Defend the auth path even before the request: a blank key is an auth
+    // failure, not an offline state — route it to settings.
+    if (!AppConfig.hasUsableAiKey) {
+      return _authFailureResult();
+    }
+
     final nextUserTurn = await _buildNextUserTurn(userMessage);
 
     final body = buildAnthropicToolRequest(
@@ -594,40 +701,60 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       messages: [..._anthropicHistory, nextUserTurn],
     );
 
-    http.Response response;
-    try {
-      response = await http
-          .post(
-            Uri.parse('https://api.anthropic.com/v1/messages'),
-            headers: _anthropicHeaders(),
-            body: jsonEncode(body),
-          )
-          .timeout(const Duration(seconds: 30));
-    } catch (_) {
-      return GuardianDecision(
-        message: 'something broke. try again.',
-        action: GuardianAction.deny,
-      );
-    }
+    AnthropicErrorClass cls = AnthropicErrorClass.ok;
+    final response = await _postAnthropicWithRetry(
+      body,
+      onClass: (c) => cls = c,
+    );
 
-    if (response.statusCode < 200 || response.statusCode >= 300) {
-      return GuardianDecision(
-        message: 'guardian is offline. try again.',
-        action: GuardianAction.deny,
-      );
+    if (response == null) {
+      // No usable response. Route by classification: auth -> settings path;
+      // everything else (retryable exhausted / client error) -> offline-style.
+      return cls == AnthropicErrorClass.auth
+          ? _authFailureResult()
+          : _offlineResult();
     }
 
     Map<String, dynamic> json;
     try {
       json = jsonDecode(response.body) as Map<String, dynamic>;
     } catch (_) {
-      return GuardianDecision(
-        message: 'something broke. try again.',
-        action: GuardianAction.deny,
-      );
+      // 2xx but undecodable body — treat as a transient offline blip.
+      return _offlineResult();
     }
 
     final content = json['content'] as List<dynamic>? ?? const [];
+    final stopReason = json['stop_reason'] as String?;
+
+    return _mapAnthropicContent(
+      nextUserTurn: nextUserTurn,
+      content: content,
+      stopReason: stopReason,
+    );
+  }
+
+  /// Map a parsed Anthropic response (content blocks + stop_reason) to a final
+  /// decision and commit the turn. Shared by the non-streaming path and the
+  /// streaming reconstruction so stop_reason handling is identical.
+  ///
+  /// stop_reason handling (tool_choice:any normally yields `tool_use`):
+  ///   - `refusal` -> an in-character safe deny; do not parse a tool block that
+  ///     isn't there.
+  ///   - `max_tokens` -> use a complete tool_use block if one was produced,
+  ///     otherwise a safe deny (our messages are short, so this is rare).
+  Future<GuardianDecision> _mapAnthropicContent({
+    required Map<String, dynamic> nextUserTurn,
+    required List<dynamic> content,
+    required String? stopReason,
+  }) {
+    if (stopReason == 'refusal') {
+      // The model declined to emit a tool call. Stay in character; do NOT try
+      // to parse a tool block that isn't there.
+      return Future.value(GuardianDecision(
+        message: 'not happening. go to sleep.',
+        action: GuardianAction.deny,
+      ));
+    }
 
     // Find the single tool_use block.
     Map<String, dynamic>? toolUse;
@@ -639,11 +766,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     }
 
     if (toolUse == null) {
-      // No tool_use found — never reach the text parser on the Anthropic path.
-      return GuardianDecision(
+      // No tool_use found (incl. max_tokens with no complete block) — never
+      // reach the text parser on the Anthropic path; safe deny.
+      return Future.value(GuardianDecision(
         message: 'no.',
         action: GuardianAction.deny,
-      );
+      ));
     }
 
     final toolName = toolUse['name'] as String? ?? '';
@@ -673,6 +801,11 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     String userMessage, {
     required void Function(String partialMessage) onDelta,
   }) async {
+    // Blank key is auth, not offline — route to settings before any network.
+    if (!AppConfig.hasUsableAiKey) {
+      return _authFailureResult();
+    }
+
     final nextUserTurn = await _buildNextUserTurn(userMessage);
 
     final body = buildAnthropicToolRequest(
@@ -680,21 +813,64 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       messages: [..._anthropicHistory, nextUserTurn],
     )..['stream'] = true;
 
+    // CONNECT-phase retry only: we retry establishing the stream (before any
+    // SSE byte is consumed) on 429/500/529 + transport failures. Once deltas
+    // start flowing we do NOT silently re-stream — a mid-stream drop falls
+    // through to the non-streaming fallback, which builds its own fresh turn
+    // (so the tool_result-first ordering is never doubled / double-committed).
     final client = http.Client();
     try {
-      final request = http.Request(
-        'POST',
-        Uri.parse('https://api.anthropic.com/v1/messages'),
-      )
-        ..headers.addAll(_anthropicHeaders())
-        ..body = jsonEncode(body);
+      const config = BackoffConfig();
+      http.StreamedResponse? streamed;
+      AnthropicErrorClass connectClass = AnthropicErrorClass.retryable;
 
-      final streamed =
-          await client.send(request).timeout(const Duration(seconds: 30));
+      for (var attempt = 0; attempt <= config.maxRetries; attempt++) {
+        http.StreamedResponse? attemptResp;
+        Object? attemptErr;
+        try {
+          final request = http.Request(
+            'POST',
+            Uri.parse('https://api.anthropic.com/v1/messages'),
+          )
+            ..headers.addAll(_anthropicHeaders())
+            ..body = jsonEncode(body);
+          attemptResp =
+              await client.send(request).timeout(const Duration(seconds: 30));
+        } catch (e) {
+          attemptErr = e;
+        }
 
-      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
-        // Drain so the socket can close, then fall back to non-streaming.
-        await streamed.stream.drain<void>().catchError((_) {});
+        final status = attemptResp?.statusCode;
+        connectClass = classifyAnthropic(status, attemptErr);
+
+        if (connectClass == AnthropicErrorClass.ok) {
+          streamed = attemptResp;
+          break;
+        }
+        // Non-2xx response we won't keep: drain so the socket can close.
+        if (attemptResp != null) {
+          await attemptResp.stream.drain<void>().catchError((_) {});
+        }
+        // Auth / client error: don't retry. Auth routes to settings; a client
+        // error falls back to the non-streaming path which surfaces the same.
+        if (connectClass == AnthropicErrorClass.auth) {
+          return _authFailureResult();
+        }
+        if (connectClass != AnthropicErrorClass.retryable) {
+          return _sendAnthropicToolUse(userMessage);
+        }
+        if (attempt == config.maxRetries) break;
+        final retryAfter =
+            status == 429 ? parseRetryAfter(attemptResp?.headers) : null;
+        await Future<void>.delayed(
+          backoffDelay(attempt, retryAfter: retryAfter, config: config),
+        );
+      }
+
+      if (streamed == null) {
+        // Connect retries exhausted on a retryable class. Don't double-commit
+        // by re-streaming; fall through to the non-streaming path (which also
+        // retries and will surface the offline result if still unreachable).
         return _sendAnthropicToolUse(userMessage);
       }
 
@@ -727,8 +903,19 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       final tail = parser.flush();
       if (tail != null) process(tail);
 
+      // stop_reason captured from message_delta. A refusal means there is no
+      // tool block to parse — return an in-character safe deny rather than
+      // falling through to the non-streaming retry (which would just re-refuse).
+      if (acc.stopReason == 'refusal') {
+        return GuardianDecision(
+          message: 'not happening. go to sleep.',
+          action: GuardianAction.deny,
+        );
+      }
+
       // Assemble the final tool-input JSON and map it. If anything is missing
-      // (no tool block, undecodable JSON), fall back to non-streaming.
+      // (no tool block, undecodable JSON — incl. a max_tokens cutoff that left
+      // the tool input incomplete), fall back to non-streaming.
       final toolName = acc.toolName;
       final toolInputJson = acc.toolInputJson;
       if (toolName == null || toolInputJson.trim().isEmpty) {
