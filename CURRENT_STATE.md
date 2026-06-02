@@ -3,13 +3,20 @@
 ## Summary
 
 Sleep Time is currently a Windows-first Flutter bedtime-boundary app with:
-- scheduled wake / wind-down / lockdown phases
-- AI negotiation using Gemini or Anthropic
-- BYOK support
-- optional Concierge Gemini fallback via build-time configuration
-- local persistence for memories, negotiations, and compliance data
-- best-effort Windows lockdown behavior
-- scaffolded Android lockdown hooks
+- scheduled wake / wind-down / lockdown phases backed by a reactive, persisted
+  schedule store (Settings and AI changes apply live and survive restarts)
+- AI negotiation via a real Claude **tool-calling** guardian (Anthropic Sonnet,
+  4-tool set, one decision per turn, prompt-cached) with Gemini as a quarantined
+  text-parsing fallback
+- an AI-adjustable schedule gated by anti-manipulation guardrails
+- per-app selective unlock on Windows (free specific apps for N minutes while the
+  rest of the desktop stays blocked)
+- a sibling watchdog process that relaunches the app if killed while locked
+- BYOK support and an optional Concierge Gemini fallback via build-time config
+- local persistence for memories, negotiations, compliance, and a schedule-change
+  audit log
+- best-effort, event-driven Windows lockdown behavior (low idle CPU)
+- scaffolded Android lockdown hooks (native background app is the next milestone)
 
 ## What is production-ready enough to use now
 

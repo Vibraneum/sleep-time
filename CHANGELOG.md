@@ -6,6 +6,30 @@ The format is based on Keep a Changelog.
 
 ## [Unreleased]
 
+### Added
+- real Anthropic tool-calling guardian (Claude Sonnet): a minimal 4-tool set
+  (`guardian_action`, `unlock_app`, `adjust_schedule`, `end_session`) so the
+  guardian emits exactly one structured decision per turn in a single
+  prompt-cached request — no more fragile "JSON on the last line" parsing
+- AI-adjustable schedule: the guardian can move bedtime/wake via `adjust_schedule`,
+  hard-clamped by anti-manipulation guardrails (bedtime envelope, ±60 min nudge,
+  +90 min/night cap, max 3 edits/night, no edit to an active lockdown, "tonight"
+  nudges auto-revert each morning) so it can't be talked out of bedtime
+- reactive, persisted schedule store — Settings and AI changes propagate live and
+  survive restarts; grant state now survives a crash (no instant re-lock)
+- per-app selective unlock on Windows: the guardian can free specific apps for N
+  minutes (corner countdown HUD) while everything else stays blocked
+- sibling watchdog process (`sleep_time_watchdog.exe`) that relaunches the app if
+  it is killed while locked (best-effort, never runs in safe/simulate mode)
+- Capabilities seam for the future Play-compliant / sideload Android build flavors
+
+### Changed
+- Windows refocus is now event-driven (`SetWinEventHook`) instead of a 500 ms Dart
+  timer + 150 ms PowerShell loop — markedly lower idle CPU/battery
+- lockdown IPC moved to `%LOCALAPPDATA%\SleepTime\state\lock.json`
+- default Anthropic model is now `claude-sonnet-4-5`
+- Gemini is retained as a quarantined text-parsing fallback (no typed tool use)
+
 ## [1.0.0] - 2026-04-11
 
 ### Added
