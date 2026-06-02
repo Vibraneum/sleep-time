@@ -281,39 +281,53 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (value != null) setState(() => _provider = value);
                 },
               ),
-              const SizedBox(height: 12),
-              SwitchListTile.adaptive(
-                value: _useBringYourOwnKey,
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Use my own Gemini key'),
-                subtitle: Text(
-                  usingConcierge
-                      ? hasConciergeKey
-                          ? 'Using the built-in Concierge Gemini key by default.'
-                          : 'No Concierge Gemini key is bundled in this build.'
-                      : 'Users can bring their own Gemini key.',
+              const SizedBox(height: 6),
+              Text(
+                _provider == AiProvider.anthropic
+                    ? 'Anthropic Claude — full tool-calling guardian (recommended).'
+                    : 'Gemini — text-only fallback (less reliable).',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF8E8EA0)),
+              ),
+              // Gemini-only controls: the BYOK toggle is meaningless under
+              // Anthropic (which always uses your key), so only show it for Gemini.
+              if (_provider == AiProvider.gemini) ...[
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  value: _useBringYourOwnKey,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Use my own Gemini key'),
+                  subtitle: Text(
+                    usingConcierge
+                        ? hasConciergeKey
+                            ? 'Using the built-in Concierge Gemini key by default.'
+                            : 'No Concierge Gemini key is bundled in this build.'
+                        : 'Bring your own Gemini key.',
+                  ),
+                  onChanged: (value) {
+                    setState(() => _useBringYourOwnKey = value);
+                  },
                 ),
-                onChanged: (value) {
-                  setState(() => _useBringYourOwnKey = value);
-                },
-              ),
-              const SizedBox(height: 12),
-              _textField('Gemini model', _geminiModelController),
-              const SizedBox(height: 12),
-              _textField(
-                'Gemini API Key',
-                _geminiKeyController,
-                obscure: true,
-                enabled: _useBringYourOwnKey,
-              ),
-              const SizedBox(height: 12),
-              _textField('Anthropic model', _anthropicModelController),
-              const SizedBox(height: 12),
-              _textField(
-                'Anthropic API Key',
-                _anthropicKeyController,
-                obscure: true,
-              ),
+                const SizedBox(height: 12),
+                _textField('Gemini model', _geminiModelController),
+                const SizedBox(height: 12),
+                _textField(
+                  'Gemini API Key',
+                  _geminiKeyController,
+                  obscure: true,
+                  enabled: _useBringYourOwnKey,
+                ),
+              ],
+              // Anthropic-only controls.
+              if (_provider == AiProvider.anthropic) ...[
+                const SizedBox(height: 12),
+                _textField('Anthropic model', _anthropicModelController),
+                const SizedBox(height: 12),
+                _textField(
+                  'Anthropic API Key',
+                  _anthropicKeyController,
+                  obscure: true,
+                ),
+              ],
             ]),
             const SizedBox(height: 16),
             _card([
