@@ -244,6 +244,71 @@ class MemoryService {
     } catch (_) {}
   }
 
+  /// Tonight's AI schedule-edit usage, read back from the audit table. Counts
+  /// rows since 22:00 whose source is an AI source (`aiTonight`/`aiPermanent`)
+  /// and whose outcome was applied (granted). Returns:
+  /// - `editsUsed`: number of applied AI schedule edits tonight.
+  /// - `lockdownDelayMin`: summed *delay* (positive minutes) applied to the
+  ///   lockdown field vs the value it had before each edit.
+  ///
+  /// The new/old values are stored as `SleepSchedule.toMap().toString()`
+  /// snapshots; we recover the lockdown minutes-of-day from those strings with
+  /// a tolerant regex so a format tweak degrades to 0 rather than throwing.
+  static Future<({int editsUsed, int lockdownDelayMin})>
+      getTonightAiScheduleBudget() async {
+    final db = await _safeDb;
+    if (db == null) return (editsUsed: 0, lockdownDelayMin: 0);
+    try {
+      final tonight = DateTime.now().copyWith(
+        hour: 22,
+        minute: 0,
+        second: 0,
+        millisecond: 0,
+        microsecond: 0,
+      );
+      final rows = await db.query(
+        'schedule_changes',
+        where: "timestamp > ? AND source IN ('aiTonight', 'aiPermanent') "
+            "AND outcome = 'granted'",
+        whereArgs: [tonight.toIso8601String()],
+        orderBy: 'timestamp ASC',
+      );
+      var editsUsed = 0;
+      var lockdownDelayMin = 0;
+      for (final row in rows) {
+        editsUsed++;
+        final field = row['field'] as String?;
+        if (field != 'lockdown') continue;
+        final oldMin = _lockdownMinutesFromSnapshot(row['old_value'] as String?);
+        final newMin = _lockdownMinutesFromSnapshot(row['new_value'] as String?);
+        if (oldMin == null || newMin == null) continue;
+        var delta = newMin - oldMin;
+        // Wrap-aware shorter direction (e.g. 23:30 -> 00:15 = +45).
+        const day = 24 * 60;
+        if (delta > day ~/ 2) delta -= day;
+        if (delta < -day ~/ 2) delta += day;
+        if (delta > 0) lockdownDelayMin += delta;
+      }
+      return (editsUsed: editsUsed, lockdownDelayMin: lockdownDelayMin);
+    } catch (_) {
+      return (editsUsed: 0, lockdownDelayMin: 0);
+    }
+  }
+
+  /// Recover lockdown minutes-of-day from a `SleepSchedule.toMap().toString()`
+  /// snapshot. The snapshot looks like `{..., lockdown: {hour: 23, minute: 30},
+  /// ...}`. Returns null when it can't be parsed.
+  static int? _lockdownMinutesFromSnapshot(String? snapshot) {
+    if (snapshot == null) return null;
+    final match = RegExp(r'lockdown:\s*\{hour:\s*(\d+),\s*minute:\s*(\d+)\}')
+        .firstMatch(snapshot);
+    if (match == null) return null;
+    final h = int.tryParse(match.group(1) ?? '');
+    final m = int.tryParse(match.group(2) ?? '');
+    if (h == null || m == null) return null;
+    return (h * 60) + m;
+  }
+
   // --- Memories ---
 
   static Future<void> saveMemory(MemoryItem item) async {
@@ -388,6 +453,7 @@ class MemoryService {
     final compliance = await getComplianceRate();
     final tonightGrants = await getTonightGrantCount();
     final memories = await getActiveMemories();
+    final aiBudget = await getTonightAiScheduleBudget();
 
     final buf = StringBuffer();
     buf.writeln('== YOUR MEMORY ==\n');
@@ -396,6 +462,10 @@ class MemoryService {
       'compliance rate (7 days): ${(compliance * 100).toStringAsFixed(0)}%',
     );
     buf.writeln('grants used tonight: $tonightGrants');
+    // Schedule-nudge budget so repeated asks are visible — the model can't
+    // pretend tonight's allowance is fresh after it has already spent it.
+    buf.writeln('schedule edits made tonight: ${aiBudget.editsUsed} of 3 '
+        '(bedtime delayed ${aiBudget.lockdownDelayMin} of 90 min)');
     buf.writeln('');
 
     if (negotiations.isNotEmpty) {

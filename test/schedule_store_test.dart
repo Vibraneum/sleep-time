@@ -69,6 +69,29 @@ void main() {
       expect(notified, 0);
     });
 
+    test('sets lastChangeSource and lastChangeNote on apply', () {
+      final store = ScheduleStore.instance;
+      final next = SleepSchedule.defaults.copyWith(
+        lockdown: const ScheduleTime(23, 45),
+      );
+      store.apply(next,
+          source: ScheduleSource.aiTonight, reason: 'one-off deadline');
+      expect(store.lastChangeSource, ScheduleSource.aiTonight);
+      expect(store.lastChangeNote, 'one-off deadline');
+    });
+
+    test('clearLastChangeNotice resets the banner notice', () {
+      final store = ScheduleStore.instance;
+      store.apply(
+        SleepSchedule.defaults.copyWith(lockdown: const ScheduleTime(23, 45)),
+        source: ScheduleSource.aiTonight,
+        reason: 'x',
+      );
+      store.clearLastChangeNotice();
+      expect(store.lastChangeSource, isNull);
+      expect(store.lastChangeNote, isNull);
+    });
+
     test('loadFromPrefs reads existing pref keys into current and baseline',
         () async {
       SharedPreferences.setMockInitialValues({
@@ -89,6 +112,84 @@ void main() {
       expect(s.lockdown, const ScheduleTime(22, 30));
       expect(s.unlock, const ScheduleTime(5, 30));
       expect(ScheduleStore.instance.baseline, s);
+    });
+  });
+
+  group('ScheduleStore.revertTonightNudges', () {
+    test('restores baseline for aiTonight-changed fields', () {
+      final store = ScheduleStore.instance;
+      store.apply(
+        SleepSchedule.defaults.copyWith(lockdown: const ScheduleTime(23, 45)),
+        source: ScheduleSource.aiTonight,
+        reason: 'tonight nudge',
+      );
+      expect(store.current.lockdown, const ScheduleTime(23, 45));
+      expect(store.tonightNudgedFields, contains('lockdown'));
+
+      store.revertTonightNudges();
+
+      expect(store.current.lockdown, SleepSchedule.defaults.lockdown);
+      expect(store.current, SleepSchedule.defaults);
+      expect(store.tonightNudgedFields, isEmpty);
+      expect(store.lastChangeSource, ScheduleSource.system);
+    });
+
+    test('leaves aiPermanent changes intact (those moved the baseline)', () {
+      final store = ScheduleStore.instance;
+      final permanent = SleepSchedule.defaults.copyWith(
+        lockdown: const ScheduleTime(23, 45),
+      );
+      store.apply(permanent, source: ScheduleSource.aiPermanent);
+      expect(store.baseline, permanent);
+
+      store.revertTonightNudges();
+
+      // No tonight nudges to revert; the permanent change stays.
+      expect(store.current, permanent);
+      expect(store.baseline, permanent);
+    });
+
+    test('leaves userSettings changes intact', () {
+      final store = ScheduleStore.instance;
+      final human = SleepSchedule.defaults.copyWith(
+        unlock: const ScheduleTime(7, 0),
+      );
+      store.apply(human, source: ScheduleSource.userSettings);
+
+      store.revertTonightNudges();
+
+      expect(store.current, human);
+      expect(store.baseline, human);
+    });
+
+    test('reverts only the nudged field, preserving an earlier permanent change',
+        () {
+      final store = ScheduleStore.instance;
+      // Permanent unlock change moves the baseline.
+      final permanent = SleepSchedule.defaults.copyWith(
+        unlock: const ScheduleTime(7, 0),
+      );
+      store.apply(permanent, source: ScheduleSource.aiPermanent);
+      // Tonight nudge to lockdown only.
+      store.apply(
+        permanent.copyWith(lockdown: const ScheduleTime(23, 50)),
+        source: ScheduleSource.aiTonight,
+      );
+
+      store.revertTonightNudges();
+
+      // lockdown reverts to baseline (23:30), but the permanent 07:00 unlock
+      // survives because it's part of the baseline now.
+      expect(store.current.lockdown, SleepSchedule.defaults.lockdown);
+      expect(store.current.unlock, const ScheduleTime(7, 0));
+    });
+
+    test('no-op when nothing was nudged', () {
+      final store = ScheduleStore.instance;
+      var notified = 0;
+      store.addListener(() => notified++);
+      store.revertTonightNudges();
+      expect(notified, 0);
     });
   });
 }

@@ -101,6 +101,13 @@ class _LockdownScreenState extends State<LockdownScreen>
     }
   }
 
+  /// The engine already applied the schedule change (through the guardrails and
+  /// ScheduleStore) before returning, so we only need to refresh the UI — the
+  /// schedule card and unlock-time text rebuild via ScheduleStore listeners.
+  void _onAdjustSchedule(GuardianDecision decision) {
+    if (mounted) setState(() {});
+  }
+
   @override
   Future<void> onWindowClose() async {
     if (AppConfig.simulateLockdown) return;
@@ -292,6 +299,11 @@ class _LockdownScreenState extends State<LockdownScreen>
   }
 
   Widget _buildChatView() {
+    // Tell the engine whether we're inside lockdown so the guardrails can
+    // forbid the AI from moving tonight's lockdown once it has started. The
+    // chat is reachable from both locked and granted states.
+    _engine.lockdownActive = widget.scheduler.state == LockdownState.locked ||
+        widget.scheduler.state == LockdownState.granted;
     return Column(
       children: [
         Container(
@@ -345,6 +357,7 @@ class _LockdownScreenState extends State<LockdownScreen>
             onMinimize: _onMinimize,
             onClose: _onClose,
             onUnlock: _onUnlock,
+            onAdjustSchedule: _onAdjustSchedule,
           ),
         ),
       ],

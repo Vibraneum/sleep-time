@@ -8,6 +8,9 @@ import 'package:http/http.dart' as http;
 import 'config.dart';
 import 'guardian_tools.dart';
 import 'memory_service.dart';
+import 'schedule.dart';
+import 'schedule_guardrails.dart';
+import 'schedule_store.dart';
 
 enum GuardianAction {
   none,
@@ -30,11 +33,17 @@ class GuardianDecision {
   final String? appLabel;
   final int? appMinutes;
 
-  // Schedule-adjust payload (data only in M1; application + guardrails are M3).
+  // Schedule-adjust payload. Application + guardrails landed in M3.
   final String? scheduleField;
   final int? scheduleHour;
   final int? scheduleMinute;
   final String? scheduleReason;
+  final ScheduleScope? scheduleScope;
+
+  /// Set in M3 after the engine runs the proposal through the guardrails and
+  /// ScheduleStore. A short, truthful outcome (e.g. "Bedtime moved to 11:45
+  /// tonight") the UI can render as a chip. Null when no schedule change ran.
+  final String? scheduleOutcomeNote;
 
   GuardianDecision({
     required this.message,
@@ -47,7 +56,26 @@ class GuardianDecision {
     this.scheduleHour,
     this.scheduleMinute,
     this.scheduleReason,
+    this.scheduleScope,
+    this.scheduleOutcomeNote,
   });
+
+  /// Copy helper used by the engine to stamp the post-guardrail outcome note
+  /// onto a decision produced by [guardianDecisionFromToolUse].
+  GuardianDecision withScheduleOutcome(String note) => GuardianDecision(
+        message: message,
+        action: action,
+        minutesGranted: minutesGranted,
+        appIdentifier: appIdentifier,
+        appLabel: appLabel,
+        appMinutes: appMinutes,
+        scheduleField: scheduleField,
+        scheduleHour: scheduleHour,
+        scheduleMinute: scheduleMinute,
+        scheduleReason: scheduleReason,
+        scheduleScope: scheduleScope,
+        scheduleOutcomeNote: note,
+      );
 
   bool get granted => action == GuardianAction.grant;
 }
@@ -125,6 +153,19 @@ class NegotiationEngine {
   // Content-block-aware history: each entry is {role, content: [...blocks]}.
   final List<dynamic> _anthropicHistory = [];
   String? _lastToolUseId;
+
+  // The tool_result string to send back on the NEXT user turn for the pending
+  // tool_use. Most tools get the generic ack; adjust_schedule overrides this
+  // with the truthful guardrail outcome (see one-turn-lag note below).
+  String _pendingToolResultAck = 'noted.';
+
+  /// Whether the device is currently inside lockdown (locked/granted). The UI
+  /// updates this from the live LockdownState; the guardrails use it to forbid
+  /// the AI from moving tonight's lockdown once we are already locked. We keep
+  /// it as a settable field (rather than always recomputing from AppConfig) so
+  /// a mid-grant state — where the clock says "unlocked" but the user is in an
+  /// active grant inside the lockdown window — still counts as active.
+  bool lockdownActive = false;
 
   String? _personalityPrompt;
   String? _systemPrompt;
@@ -329,9 +370,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       'content': buildUserTurnContent(
         userMessage: userMessage,
         pendingToolUseId: _lastToolUseId,
+        toolResultAck: _pendingToolResultAck,
       ),
     });
     _lastToolUseId = null;
+    // Reset to the generic ack; only adjust_schedule re-sets it below.
+    _pendingToolResultAck = 'noted.';
 
     final body = buildAnthropicToolRequest(
       systemPrompt: _systemPrompt ?? '',
@@ -398,7 +442,115 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     final toolName = toolUse['name'] as String? ?? '';
     final input = (toolUse['input'] as Map?)?.cast<String, dynamic>() ??
         <String, dynamic>{};
-    return guardianDecisionFromToolUse(toolName, input);
+    final decision = guardianDecisionFromToolUse(toolName, input);
+
+    if (decision.action == GuardianAction.adjustSchedule) {
+      return _applyScheduleAdjustment(decision);
+    }
+    return decision;
+  }
+
+  /// Run an `adjust_schedule` proposal through the guardrails, apply it (or
+  /// not) via [ScheduleStore], and stage a truthful tool_result for the NEXT
+  /// user turn.
+  ///
+  /// ONE-TURN-LAG NOTE: the guardian's own `message` was already produced in
+  /// the SAME turn it called the tool, so it is shown to the user immediately
+  /// and may not match what the guardrails actually did. The truthful
+  /// correction (`_pendingToolResultAck`) only reaches the model on the user's
+  /// NEXT turn, as the tool_result block. So if the model promised "moved to
+  /// 1 AM" but the guardrails clamped to 12:30, the user sees the optimistic
+  /// line now, and the model can self-correct on its next reply. The
+  /// `scheduleOutcomeNote` carried on the returned decision lets the UI show
+  /// the real outcome immediately as a chip.
+  Future<GuardianDecision> _applyScheduleAdjustment(
+    GuardianDecision decision,
+  ) async {
+    final field = decision.scheduleField;
+    final hour = decision.scheduleHour;
+    final minute = decision.scheduleMinute;
+    final scope = decision.scheduleScope ?? ScheduleScope.tonight;
+
+    if (field == null || hour == null || minute == null) {
+      _pendingToolResultAck = 'schedule change REJECTED (incomplete request)';
+      return decision.withScheduleOutcome('Schedule change ignored.');
+    }
+
+    final store = ScheduleStore.instance;
+    final budgetRaw = await MemoryService.getTonightAiScheduleBudget();
+    final budget = NightlyAiBudget(
+      editsUsed: budgetRaw.editsUsed,
+      cumulativeLockdownDelayMin: budgetRaw.lockdownDelayMin,
+    );
+
+    final result = ScheduleGuardrails.evaluate(
+      baseline: store.baseline,
+      current: store.current,
+      field: field,
+      hour: hour,
+      minute: minute,
+      scope: scope,
+      budget: budget,
+      lockdownActive: lockdownActive,
+    );
+
+    final appliedTime = result.applied;
+    final newField = _timeForField(appliedTime, field);
+    final hhmm =
+        '${newField.hour.toString().padLeft(2, '0')}:${newField.minute.toString().padLeft(2, '0')}';
+
+    switch (result.outcome) {
+      case GuardrailOutcome.granted:
+        store.apply(
+          result.applied,
+          source: scope == ScheduleScope.permanent
+              ? ScheduleSource.aiPermanent
+              : ScheduleSource.aiTonight,
+          reason: decision.scheduleReason,
+        );
+        _pendingToolResultAck = 'schedule change $field -> $hhmm: GRANTED';
+        return decision.withScheduleOutcome(
+          scope == ScheduleScope.permanent
+              ? '$field moved to $hhmm permanently'
+              : '$field moved to $hhmm tonight · back to baseline tomorrow',
+        );
+      case GuardrailOutcome.clamped:
+        store.apply(
+          result.applied,
+          source: scope == ScheduleScope.permanent
+              ? ScheduleSource.aiPermanent
+              : ScheduleSource.aiTonight,
+          reason: decision.scheduleReason,
+        );
+        _pendingToolResultAck =
+            'schedule change $field CLAMPED to $hhmm (${result.humanReason})';
+        return decision.withScheduleOutcome(
+          scope == ScheduleScope.permanent
+              ? '$field set to $hhmm (${result.humanReason})'
+              : '$field set to $hhmm tonight (${result.humanReason})',
+        );
+      case GuardrailOutcome.rejected:
+        _pendingToolResultAck =
+            'schedule change $field REJECTED (${result.humanReason})';
+        return decision.withScheduleOutcome(
+          'Change blocked: ${result.humanReason}',
+        );
+    }
+  }
+
+  ScheduleTime _timeForField(SleepSchedule s, String field) {
+    switch (field) {
+      case 'wakeUp':
+        return s.wakeUp;
+      case 'windDown':
+        return s.windDown;
+      case 'lockdown':
+        return s.lockdown;
+      case 'unlock':
+        return s.unlock;
+      default:
+        return s.lockdown;
+    }
   }
 
   String _missingKeyMessage() {

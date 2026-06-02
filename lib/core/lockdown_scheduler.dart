@@ -4,6 +4,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
 import 'memory_service.dart';
+import 'schedule_store.dart';
 
 enum LockdownState {
   inactive,
@@ -25,6 +26,13 @@ class LockdownScheduler {
   bool _lockdownNotified = false;
   bool _permanentlyUnlocked = false;
   String? _lastSleepLogDate;
+
+  /// The lockdown-start instant captured when we FIRST entered `locked` this
+  /// night. Used by [_logSleepIfNeeded] instead of a fresh
+  /// `lockdownStartForDate` so a mid-night schedule edit (which would move the
+  /// computed lockdown start) cannot double-log or skip a sleep_log row.
+  /// Cleared on the nightly reset.
+  DateTime? _activeLockdownStart;
 
   final void Function(LockdownState state) onStateChange;
   final void Function(Duration remaining)? onGrantTick;
@@ -55,10 +63,15 @@ class LockdownScheduler {
   void start() {
     // Restore any in-flight grant from a previous run before the first tick.
     unawaited(restoreGrantState());
+    // React to live schedule edits (human or guardian) immediately so a change
+    // takes effect without waiting for the next 15s tick.
+    ScheduleStore.instance.addListener(_onScheduleChanged);
     // Defer first update so it doesn't fire during initState/build
     Timer(Duration.zero, _updateState);
     _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _updateState());
   }
+
+  void _onScheduleChanged() => _updateState();
 
   /// Persist the current grant state. Fire-and-forget; failures are swallowed
   /// to match the rest of the persistence layer.
@@ -117,6 +130,7 @@ class LockdownScheduler {
   }
 
   void stop() {
+    ScheduleStore.instance.removeListener(_onScheduleChanged);
     _ticker?.cancel();
     _grantTimer?.cancel();
     _ticker = null;
@@ -140,6 +154,13 @@ class LockdownScheduler {
       _lockdownNotified = true;
     }
 
+    // Capture the night's lockdown start the FIRST time we enter locked. A
+    // later schedule edit shifts what lockdownStartForDate would compute, so we
+    // freeze it here and reuse it for sleep logging.
+    if (newState == LockdownState.locked && _activeLockdownStart == null) {
+      _activeLockdownStart = AppConfig.lockdownStartForDate(DateTime.now());
+    }
+
     if ((previousState == LockdownState.locked ||
             previousState == LockdownState.granted) &&
         newState == LockdownState.unlocked) {
@@ -148,6 +169,9 @@ class LockdownScheduler {
       _grantedMinutesTonight = 0;
       _windDownNotified = false;
       _lockdownNotified = false;
+      _activeLockdownStart = null;
+      // Roll back any tonight-only guardian nudges for the next night.
+      ScheduleStore.instance.revertTonightNudges();
       unawaited(_persistGrantState());
     }
   }
@@ -201,7 +225,11 @@ class LockdownScheduler {
 
   Future<void> _logSleepIfNeeded() async {
     final now = DateTime.now();
-    final lockdownStart = AppConfig.lockdownStartForDate(now);
+    // Prefer the start captured at lock-entry; fall back to a fresh compute
+    // only if we somehow never recorded one (e.g. grant restored across a
+    // restart without re-entering locked).
+    final lockdownStart =
+        _activeLockdownStart ?? AppConfig.lockdownStartForDate(now);
     final date = lockdownStart.toIso8601String().split('T')[0];
     if (_lastSleepLogDate == date) return;
     _lastSleepLogDate = date;

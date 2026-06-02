@@ -50,12 +50,40 @@ class ScheduleStore extends ChangeNotifier {
   SleepSchedule _current = SleepSchedule.defaults;
   SleepSchedule _baseline = SleepSchedule.defaults;
 
+  /// Fields changed by an `aiTonight` apply this night, so [revertTonightNudges]
+  /// knows exactly which fields to roll back to baseline. Cleared on revert and
+  /// on any userSettings/aiPermanent apply (those move the baseline).
+  final Set<String> _tonightNudgedFields = {};
+
+  /// The source of the most recent apply (any source). Used by the home banner
+  /// to decide whether the guardian touched the schedule.
+  ScheduleSource? _lastChangeSource;
+
+  /// A short human note about the most recent change, for the UI banner/chip.
+  String? _lastChangeNote;
+
   /// The live schedule. Safe to read before [loadFromPrefs] (returns defaults).
   SleepSchedule get current => _current;
 
-  /// The human-set schedule. AI "tonight" nudges should revert to this later
-  /// (no revert logic in M0 — just stored and exposed).
+  /// The human-set schedule. AI "tonight" nudges revert to this on the nightly
+  /// reset (see [revertTonightNudges]).
   SleepSchedule get baseline => _baseline;
+
+  /// Source of the most recent apply, or null if none has happened.
+  ScheduleSource? get lastChangeSource => _lastChangeSource;
+
+  /// Short human note about the most recent change, or null.
+  String? get lastChangeNote => _lastChangeNote;
+
+  /// Fields the AI has nudged for tonight (read-only view, for tests/UI).
+  Set<String> get tonightNudgedFields => Set.unmodifiable(_tonightNudgedFields);
+
+  /// Clear the banner notice (e.g. when the user dismisses the home banner).
+  void clearLastChangeNotice() {
+    _lastChangeSource = null;
+    _lastChangeNote = null;
+    notifyListeners();
+  }
 
   /// Load the schedule from SharedPreferences using the existing pref keys.
   /// Populates both [current] and [baseline].
@@ -118,8 +146,17 @@ class ScheduleStore extends ChangeNotifier {
     _current = next;
     if (source == ScheduleSource.userSettings ||
         source == ScheduleSource.aiPermanent) {
+      // These move the baseline, so there is nothing to revert later.
       _baseline = next;
+      _tonightNudgedFields.clear();
+    } else if (source == ScheduleSource.aiTonight) {
+      // Track exactly which fields drifted from baseline so the nightly reset
+      // can roll back only those.
+      _recordTonightDrift(next);
     }
+
+    _lastChangeSource = source;
+    _lastChangeNote = reason;
 
     // Persist (fire-and-forget; swallow failures).
     _persist(next);
@@ -140,6 +177,58 @@ class ScheduleStore extends ChangeNotifier {
       applied: next,
       reasons: const [],
     );
+  }
+
+  /// Record which fields of [next] differ from the current baseline so a later
+  /// [revertTonightNudges] restores exactly those.
+  void _recordTonightDrift(SleepSchedule next) {
+    if (next.wakeUp != _baseline.wakeUp) _tonightNudgedFields.add('wakeUp');
+    if (next.windDown != _baseline.windDown) {
+      _tonightNudgedFields.add('windDown');
+    }
+    if (next.lockdown != _baseline.lockdown) {
+      _tonightNudgedFields.add('lockdown');
+    }
+    if (next.unlock != _baseline.unlock) _tonightNudgedFields.add('unlock');
+  }
+
+  /// Roll back any `aiTonight` nudges to the baseline, leaving aiPermanent /
+  /// userSettings changes intact (those already moved the baseline). No-op when
+  /// nothing was nudged. Persists, audits, and notifies on a real change.
+  /// Called by the scheduler on the nightly reset.
+  void revertTonightNudges() {
+    if (_tonightNudgedFields.isEmpty) return;
+
+    final previous = _current;
+    var reverted = _current;
+    for (final field in _tonightNudgedFields) {
+      switch (field) {
+        case 'wakeUp':
+          reverted = reverted.copyWith(wakeUp: _baseline.wakeUp);
+        case 'windDown':
+          reverted = reverted.copyWith(windDown: _baseline.windDown);
+        case 'lockdown':
+          reverted = reverted.copyWith(lockdown: _baseline.lockdown);
+        case 'unlock':
+          reverted = reverted.copyWith(unlock: _baseline.unlock);
+      }
+    }
+    _tonightNudgedFields.clear();
+
+    if (reverted == previous) return;
+
+    _current = reverted;
+    _lastChangeSource = ScheduleSource.system;
+    _lastChangeNote = 'reverted tonight\'s nudges to baseline';
+    _persist(reverted);
+    MemoryService.logScheduleChange(
+      source: ScheduleSource.system.name,
+      oldValue: previous.toMap().toString(),
+      newValue: reverted.toMap().toString(),
+      reason: 'nightly revert of tonight nudges',
+      outcome: ScheduleOutcome.granted.name,
+    );
+    notifyListeners();
   }
 
   Future<void> _persist(SleepSchedule s) async {

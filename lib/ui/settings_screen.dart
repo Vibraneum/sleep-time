@@ -33,6 +33,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late TimeOfDay _unlockTime;
   bool _saved = false;
 
+  /// Inline validation errors for the schedule, surfaced as red helper text
+  /// under the Schedule card. Populated on a blocked save.
+  List<String> _scheduleErrors = const [];
+
   @override
   void initState() {
     super.initState();
@@ -62,6 +66,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _save() async {
+    // Build + validate the proposed schedule first; block the save (with inline
+    // red helper text) if it would be rejected by SleepSchedule.validate so we
+    // never persist an invalid schedule.
+    final proposed = SleepSchedule(
+      wakeUp: ScheduleTime(_wakeUpTime.hour, _wakeUpTime.minute),
+      windDown: ScheduleTime(_windDownTime.hour, _windDownTime.minute),
+      lockdown: ScheduleTime(_lockdownTime.hour, _lockdownTime.minute),
+      unlock: ScheduleTime(_unlockTime.hour, _unlockTime.minute),
+    );
+    final validation = proposed.validate();
+    if (!validation.ok) {
+      setState(() => _scheduleErrors = validation.violations);
+      return;
+    }
+
+    // Human escape hatch: moving the unlock EARLIER while we're inside the
+    // lockdown window would end the lock sooner than promised. Humans are
+    // allowed to do this (the AI is not), but confirm it first. We use
+    // AppConfig.isLockdownTime as the "currently locked" signal because the
+    // settings screen has no scheduler reference; this also covers the granted
+    // sub-state, which still falls inside the lockdown window.
+    final currentUnlockMin = AppConfig.unlockHour * 60 + AppConfig.unlockMinute;
+    final newUnlockMin = _unlockTime.hour * 60 + _unlockTime.minute;
+    if (AppConfig.isLockdownTime(DateTime.now()) &&
+        newUnlockMin < currentUnlockMin) {
+      final confirmed = await _confirmEarlierUnlock();
+      if (confirmed != true) return;
+    }
+
+    setState(() => _scheduleErrors = const []);
+
     final prefs = await SharedPreferences.getInstance();
 
     await prefs.setString('ai_provider', _provider.name);
@@ -78,14 +113,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
       _anthropicModelController.text.trim(),
     );
     // Schedule writes funnel through ScheduleStore so the change persists,
-    // validates, audits, and notifies live listeners.
+    // validates, audits, and notifies live listeners. Already validated above.
     ScheduleStore.instance.apply(
-      SleepSchedule(
-        wakeUp: ScheduleTime(_wakeUpTime.hour, _wakeUpTime.minute),
-        windDown: ScheduleTime(_windDownTime.hour, _windDownTime.minute),
-        lockdown: ScheduleTime(_lockdownTime.hour, _lockdownTime.minute),
-        unlock: ScheduleTime(_unlockTime.hour, _unlockTime.minute),
-      ),
+      proposed,
       source: ScheduleSource.userSettings,
     );
     await prefs.setString('safe_word', _safeWordController.text.trim());
@@ -120,6 +150,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _saved = false);
     });
+  }
+
+  Future<bool?> _confirmEarlierUnlock() {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+        ),
+        title: const Text(
+          'End lockdown earlier?',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF1A1A2E),
+          ),
+        ),
+        content: const Text(
+          "You're currently in a lockdown window and moving the unlock time "
+          'earlier. This will let you out sooner than the schedule promised. '
+          'Continue?',
+          style: TextStyle(fontSize: 14, color: Color(0xFF8E8EA0), height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: Color(0xFF8E8EA0)),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text(
+              'Unlock earlier',
+              style: TextStyle(
+                color: Color(0xFF5B5FEF),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _pickTime(
@@ -235,6 +310,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _timeRow('Wind down', _windDownTime, (t) => _windDownTime = t),
               _timeRow('Lockdown', _lockdownTime, (t) => _lockdownTime = t),
               _timeRow('Unlock', _unlockTime, (t) => _unlockTime = t),
+              if (_scheduleErrors.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                for (final err in _scheduleErrors)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      err,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFFFF3B30),
+                      ),
+                    ),
+                  ),
+              ],
             ]),
             const SizedBox(height: 16),
             _card([

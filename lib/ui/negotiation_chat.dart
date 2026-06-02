@@ -31,7 +31,12 @@ class NegotiationChat extends StatefulWidget {
 class _ChatMessage {
   final String text;
   final bool isUser;
-  _ChatMessage({required this.text, required this.isUser});
+
+  /// When set on a guardian message, a small info chip is shown beneath the
+  /// bubble describing the real outcome of an adjust_schedule call.
+  final String? scheduleNote;
+
+  _ChatMessage({required this.text, required this.isUser, this.scheduleNote});
 }
 
 class _NegotiationChatState extends State<NegotiationChat> {
@@ -106,7 +111,11 @@ class _NegotiationChatState extends State<NegotiationChat> {
     try {
       final decision = await widget.engine.negotiate(text);
       setState(() {
-        _messages.add(_ChatMessage(text: decision.message, isUser: false));
+        _messages.add(_ChatMessage(
+          text: decision.message,
+          isUser: false,
+          scheduleNote: decision.scheduleOutcomeNote,
+        ));
         _isLoading = false;
       });
 
@@ -136,8 +145,10 @@ class _NegotiationChatState extends State<NegotiationChat> {
             break;
         }
       } else if (decision.action == GuardianAction.adjustSchedule) {
-        // TODO(M3): apply the schedule change with guardrails. For now just
-        // surface the message (already shown) and stay in the chat.
+        // The engine already ran the proposal through the guardrails and
+        // ScheduleStore before returning. We've shown the guardian's message
+        // and the truthful outcome chip; just notify the host (to refresh the
+        // schedule UI) and stay in the chat — adjust_schedule is not terminal.
         widget.onAdjustSchedule?.call(decision);
       }
     } catch (e) {
@@ -279,25 +290,67 @@ class _NegotiationChatState extends State<NegotiationChat> {
             const SizedBox(width: 8),
           ],
           Flexible(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-              decoration: BoxDecoration(
-                color: msg.isUser
-                    ? const Color(0xFF5B5FEF).withAlpha(40)
-                    : Colors.white.withAlpha(10),
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Text(
-                msg.text,
-                style: TextStyle(
-                  color: Colors.white.withAlpha(220),
-                  fontSize: 15,
-                  height: 1.4,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                      horizontal: 14, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: msg.isUser
+                        ? const Color(0xFF5B5FEF).withAlpha(40)
+                        : Colors.white.withAlpha(10),
+                    borderRadius: BorderRadius.circular(16),
+                  ),
+                  child: Text(
+                    msg.text,
+                    style: TextStyle(
+                      color: Colors.white.withAlpha(220),
+                      fontSize: 15,
+                      height: 1.4,
+                    ),
+                  ),
                 ),
-              ),
+                if (msg.scheduleNote != null) ...[
+                  const SizedBox(height: 6),
+                  _scheduleNoteChip(msg.scheduleNote!),
+                ],
+              ],
             ),
           ),
           if (msg.isUser) const SizedBox(width: 38),
+        ],
+      ),
+    );
+  }
+
+  Widget _scheduleNoteChip(String note) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: const Color(0xFF5B5FEF).withAlpha(30),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF5B5FEF).withAlpha(60)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(
+            Icons.schedule_rounded,
+            size: 13,
+            color: Color(0xFF8E8EFF),
+          ),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              note,
+              style: const TextStyle(
+                color: Color(0xFF8E8EFF),
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
+          ),
         ],
       ),
     );

@@ -97,6 +97,7 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 28),
               _buildStatusCard(),
               const SizedBox(height: 16),
+              _buildGuardianScheduleBanner(),
               _buildScheduleCard(),
               const SizedBox(height: 16),
               _buildStatsCard(),
@@ -277,6 +278,74 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
+    );
+  }
+
+  Widget _buildGuardianScheduleBanner() {
+    return ListenableBuilder(
+      listenable: ScheduleStore.instance,
+      builder: (context, _) {
+        final source = ScheduleStore.instance.lastChangeSource;
+        final isAi = source == ScheduleSource.aiTonight ||
+            source == ScheduleSource.aiPermanent;
+        if (!isAi) return const SizedBox.shrink();
+        final note = ScheduleStore.instance.lastChangeNote;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: const Color(0xFFEEEEFC),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.auto_awesome_rounded,
+                  color: Color(0xFF5B5FEF),
+                  size: 20,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Guardian adjusted your schedule',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF5B5FEF),
+                        ),
+                      ),
+                      if (note != null && note.trim().isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          note,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF5B5FEF),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () =>
+                      ScheduleStore.instance.clearLastChangeNotice(),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    color: Color(0xFF5B5FEF),
+                    size: 18,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 

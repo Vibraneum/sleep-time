@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import 'config.dart';
 import 'negotiation_engine.dart' show GuardianAction, GuardianDecision;
+import 'schedule_guardrails.dart' show ScheduleScope;
 
 /// The Anthropic Messages tool-use toolset for the guardian, plus strict
 /// mapping from a tool_use block to a [GuardianDecision].
@@ -207,6 +208,11 @@ GuardianDecision guardianDecisionFromToolUse(
       }
       final hour = (input['hour'] as num?)?.toInt();
       final minute = (input['minute'] as num?)?.toInt();
+      // Default to tonight when scope is absent — a tonight nudge is the
+      // mostly-revertible, lower-stakes option.
+      final scope = (input['scope'] as String?)?.toLowerCase() == 'permanent'
+          ? ScheduleScope.permanent
+          : ScheduleScope.tonight;
       return GuardianDecision(
         message: message,
         action: GuardianAction.adjustSchedule,
@@ -214,6 +220,7 @@ GuardianDecision guardianDecisionFromToolUse(
         scheduleHour: hour,
         scheduleMinute: minute,
         scheduleReason: input['reason'] as String?,
+        scheduleScope: scope,
       );
     case 'end_session':
       return GuardianDecision(
