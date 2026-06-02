@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import 'schedule_store.dart';
+
 enum AiProvider { gemini, anthropic }
 
 /// App configuration — schedule, providers, keys, and state helpers.
@@ -11,7 +13,7 @@ class AppConfig {
   static AiProvider aiProvider = AiProvider.gemini;
   static bool useBringYourOwnKey = false;
   static String geminiModel = 'gemini-2.5-flash';
-  static String anthropicModel = 'claude-haiku-4-5-20251001';
+  static String anthropicModel = 'claude-sonnet-4-5';
   static String safeWord = 'dontdie';
 
   /// Off by default. The previous default of `true` silently registered the
@@ -30,15 +32,18 @@ class AppConfig {
   /// time via `--dart-define=SIMULATE_LOCKDOWN=true|false`.
   static bool simulateLockdown = kDebugMode;
 
-  // Schedule — all configurable
-  static int wakeUpHour = 22; // 10:30 PM — guardian wakes up
-  static int wakeUpMinute = 30;
-  static int windDownHour = 23; // 11:00 PM — "start wrapping up"
-  static int windDownMinute = 0;
-  static int lockdownHour = 23; // 11:30 PM — lockdown
-  static int lockdownMinute = 30;
-  static int unlockHour = 6; // 6:00 AM — free
-  static int unlockMinute = 0;
+  // Schedule — single source of truth lives in ScheduleStore. These getters
+  // delegate so every existing reader keeps working unchanged.
+  static int get wakeUpHour => ScheduleStore.instance.current.wakeUp.hour;
+  static int get wakeUpMinute => ScheduleStore.instance.current.wakeUp.minute;
+  static int get windDownHour => ScheduleStore.instance.current.windDown.hour;
+  static int get windDownMinute =>
+      ScheduleStore.instance.current.windDown.minute;
+  static int get lockdownHour => ScheduleStore.instance.current.lockdown.hour;
+  static int get lockdownMinute =>
+      ScheduleStore.instance.current.lockdown.minute;
+  static int get unlockHour => ScheduleStore.instance.current.unlock.hour;
+  static int get unlockMinute => ScheduleStore.instance.current.unlock.minute;
 
   static const int minGrantedMinutes = 1;
   static const int maxGrantedMinutes = 120;

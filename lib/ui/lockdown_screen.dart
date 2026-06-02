@@ -6,6 +6,7 @@ import 'package:window_manager/window_manager.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/negotiation_engine.dart';
 import '../core/config.dart';
+import '../core/schedule_store.dart';
 import '../platform/windows_lockdown.dart';
 import 'negotiation_chat.dart';
 import 'home_screen.dart';
@@ -241,11 +242,14 @@ class _LockdownScreenState extends State<LockdownScreen>
             ),
           ),
           const SizedBox(height: 8),
-          Text(
-            'Unlocks at ${AppConfig.formatTime(AppConfig.unlockHour, AppConfig.unlockMinute)}',
-            style: TextStyle(
-              color: Colors.white.withAlpha(40),
-              fontSize: 12,
+          ListenableBuilder(
+            listenable: ScheduleStore.instance,
+            builder: (context, _) => Text(
+              'Unlocks at ${AppConfig.formatTime(AppConfig.unlockHour, AppConfig.unlockMinute)}',
+              style: TextStyle(
+                color: Colors.white.withAlpha(40),
+                fontSize: 12,
+              ),
             ),
           ),
           const SizedBox(height: 56),

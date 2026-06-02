@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart' show databaseFactory, databaseFactoryFfi, sqfliteFfiInit;
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
+import 'core/schedule_store.dart';
 import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
@@ -46,7 +47,7 @@ Future<void> _loadConfig() async {
   AppConfig.geminiModel =
       prefs.getString('gemini_model') ?? 'gemini-2.5-flash';
   AppConfig.anthropicModel =
-      prefs.getString('anthropic_model') ?? 'claude-haiku-4-5-20251001';
+      prefs.getString('anthropic_model') ?? 'claude-sonnet-4-5';
 
   AppConfig.safeWord = prefs.getString('safe_word') ?? 'dontdie';
 
@@ -64,14 +65,7 @@ Future<void> _loadConfig() async {
         prefs.getBool('simulate_lockdown') ?? kDebugMode;
   }
 
-  AppConfig.wakeUpHour = prefs.getInt('wakeup_hour') ?? 22;
-  AppConfig.wakeUpMinute = prefs.getInt('wakeup_minute') ?? 30;
-  AppConfig.windDownHour = prefs.getInt('winddown_hour') ?? 23;
-  AppConfig.windDownMinute = prefs.getInt('winddown_minute') ?? 0;
-  AppConfig.lockdownHour = prefs.getInt('lockdown_hour') ?? 23;
-  AppConfig.lockdownMinute = prefs.getInt('lockdown_minute') ?? 30;
-  AppConfig.unlockHour = prefs.getInt('unlock_hour') ?? 6;
-  AppConfig.unlockMinute = prefs.getInt('unlock_minute') ?? 0;
+  // Schedule now lives in ScheduleStore (loaded in main() before runApp).
 
   // Auto-complete setup if key already available
   if (AppConfig.hasUsableAiKey && !_setupComplete) {
@@ -123,6 +117,7 @@ Future<void> main() async {
   // Clean up any leftover lockdown state from a previous crash.
   await WindowsLockdown.restoreSystemState();
 
+  await ScheduleStore.instance.loadFromPrefs();
   await _loadConfig();
   runApp(const SleepTimeApp());
 }

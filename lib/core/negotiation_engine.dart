@@ -8,17 +8,44 @@ import 'package:http/http.dart' as http;
 import 'config.dart';
 import 'memory_service.dart';
 
-enum GuardianAction { none, grant, deny, minimize, close, unlock }
+enum GuardianAction {
+  none,
+  grant,
+  deny,
+  minimize,
+  close,
+  unlock,
+  unlockApp,
+  adjustSchedule,
+}
 
 class GuardianDecision {
   final String message;
   final GuardianAction action;
   final int minutesGranted;
 
+  // Selective app-unlock payload (M1 tool-calling; data shape only in M0).
+  final String? appIdentifier;
+  final String? appLabel;
+  final int? appMinutes;
+
+  // Schedule-adjust payload (M1 tool-calling; data shape only in M0).
+  final String? scheduleField;
+  final int? scheduleHour;
+  final int? scheduleMinute;
+  final String? scheduleReason;
+
   GuardianDecision({
     required this.message,
     this.action = GuardianAction.none,
     this.minutesGranted = 0,
+    this.appIdentifier,
+    this.appLabel,
+    this.appMinutes,
+    this.scheduleField,
+    this.scheduleHour,
+    this.scheduleMinute,
+    this.scheduleReason,
   });
 
   bool get granted => action == GuardianAction.grant;

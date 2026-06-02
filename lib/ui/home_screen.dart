@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/config.dart';
 import '../core/memory_service.dart';
+import '../core/schedule_store.dart';
 import '../platform/android_lockdown.dart';
 import '../platform/windows_lockdown.dart';
 import 'lockdown_screen.dart';
@@ -280,7 +281,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Widget _buildScheduleCard() {
-    return Container(
+    return ListenableBuilder(
+      listenable: ScheduleStore.instance,
+      builder: (context, _) => Container(
       width: double.infinity,
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -335,6 +338,7 @@ class _HomeScreenState extends State<HomeScreen> {
             isLast: true,
           ),
         ],
+      ),
       ),
     );
   }

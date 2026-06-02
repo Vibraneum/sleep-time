@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/config.dart';
+import '../core/schedule.dart';
+import '../core/schedule_store.dart';
 import '../platform/windows_lockdown.dart';
 
 class SettingsScreen extends StatefulWidget {
@@ -75,14 +77,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
       'anthropic_model',
       _anthropicModelController.text.trim(),
     );
-    await prefs.setInt('wakeup_hour', _wakeUpTime.hour);
-    await prefs.setInt('wakeup_minute', _wakeUpTime.minute);
-    await prefs.setInt('winddown_hour', _windDownTime.hour);
-    await prefs.setInt('winddown_minute', _windDownTime.minute);
-    await prefs.setInt('lockdown_hour', _lockdownTime.hour);
-    await prefs.setInt('lockdown_minute', _lockdownTime.minute);
-    await prefs.setInt('unlock_hour', _unlockTime.hour);
-    await prefs.setInt('unlock_minute', _unlockTime.minute);
+    // Schedule writes funnel through ScheduleStore so the change persists,
+    // validates, audits, and notifies live listeners.
+    ScheduleStore.instance.apply(
+      SleepSchedule(
+        wakeUp: ScheduleTime(_wakeUpTime.hour, _wakeUpTime.minute),
+        windDown: ScheduleTime(_windDownTime.hour, _windDownTime.minute),
+        lockdown: ScheduleTime(_lockdownTime.hour, _lockdownTime.minute),
+        unlock: ScheduleTime(_unlockTime.hour, _unlockTime.minute),
+      ),
+      source: ScheduleSource.userSettings,
+    );
     await prefs.setString('safe_word', _safeWordController.text.trim());
     await prefs.setBool('run_at_startup', _runAtStartup);
     await prefs.setBool('simulate_lockdown', _simulateLockdown);
@@ -96,16 +101,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ? 'gemini-2.5-flash'
         : _geminiModelController.text.trim();
     AppConfig.anthropicModel = _anthropicModelController.text.trim().isEmpty
-        ? 'claude-3-5-sonnet-latest'
+        ? 'claude-sonnet-4-5'
         : _anthropicModelController.text.trim();
-    AppConfig.wakeUpHour = _wakeUpTime.hour;
-    AppConfig.wakeUpMinute = _wakeUpTime.minute;
-    AppConfig.windDownHour = _windDownTime.hour;
-    AppConfig.windDownMinute = _windDownTime.minute;
-    AppConfig.lockdownHour = _lockdownTime.hour;
-    AppConfig.lockdownMinute = _lockdownTime.minute;
-    AppConfig.unlockHour = _unlockTime.hour;
-    AppConfig.unlockMinute = _unlockTime.minute;
+    // Schedule mirrored into ScheduleStore above via apply().
     AppConfig.safeWord = _safeWordController.text.trim();
     AppConfig.runAtStartup = _runAtStartup;
     AppConfig.simulateLockdown = _simulateLockdown;

@@ -152,7 +152,7 @@ class MemoryService {
     final dbPath = await appDataPath;
     _db = await openDatabase(
       p.join(dbPath, 'sleep_guardian.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE memories (
@@ -195,9 +195,53 @@ class MemoryService {
             compliance_score REAL DEFAULT 1.0
           )
         ''');
+        await db.execute(_scheduleChangesSchema);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(_scheduleChangesSchema);
+        }
       },
     );
     return _db!;
+  }
+
+  static const String _scheduleChangesSchema = '''
+    CREATE TABLE schedule_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      source TEXT NOT NULL,
+      field TEXT,
+      old_value TEXT,
+      new_value TEXT,
+      reason TEXT,
+      outcome TEXT
+    )
+  ''';
+
+  /// Audit a schedule change. Fire-and-forget; failures are swallowed to
+  /// match the rest of the persistence layer.
+  static Future<void> logScheduleChange({
+    required String source,
+    String? field,
+    String? oldValue,
+    String? newValue,
+    String? reason,
+    String? outcome,
+  }) async {
+    final db = await _safeDb;
+    if (db == null) return;
+    try {
+      await db.insert('schedule_changes', {
+        'timestamp': DateTime.now().toIso8601String(),
+        'source': source,
+        'field': field,
+        'old_value': oldValue,
+        'new_value': newValue,
+        'reason': reason,
+        'outcome': outcome,
+      });
+    } catch (_) {}
   }
 
   // --- Memories ---

@@ -1,5 +1,7 @@
 import 'dart:async';
 
+import 'package:shared_preferences/shared_preferences.dart';
+
 import 'config.dart';
 import 'memory_service.dart';
 
@@ -34,6 +36,12 @@ class LockdownScheduler {
     this.onGrantExpired,
   });
 
+  // Pref keys for persisting grant state across restarts so a crash
+  // mid-grant restores the remaining time instead of instant re-lock.
+  static const _grantExpiryKey = 'grant_expiry_ms';
+  static const _grantsUsedKey = 'grants_used_tonight';
+  static const _grantedMinutesKey = 'granted_minutes_tonight';
+
   LockdownState get state => _state;
   int get grantsUsedTonight => _grantsUsedTonight;
   DateTime? get grantExpiry => _grantExpiry;
@@ -45,9 +53,67 @@ class LockdownScheduler {
   }
 
   void start() {
+    // Restore any in-flight grant from a previous run before the first tick.
+    unawaited(restoreGrantState());
     // Defer first update so it doesn't fire during initState/build
     Timer(Duration.zero, _updateState);
     _ticker = Timer.periodic(const Duration(seconds: 15), (_) => _updateState());
+  }
+
+  /// Persist the current grant state. Fire-and-forget; failures are swallowed
+  /// to match the rest of the persistence layer.
+  Future<void> _persistGrantState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_grantExpiry != null) {
+        await prefs.setInt(
+            _grantExpiryKey, _grantExpiry!.millisecondsSinceEpoch);
+      } else {
+        await prefs.remove(_grantExpiryKey);
+      }
+      await prefs.setInt(_grantsUsedKey, _grantsUsedTonight);
+      await prefs.setInt(_grantedMinutesKey, _grantedMinutesTonight);
+    } catch (_) {}
+  }
+
+  /// Reload grant state on start. If a stored expiry is still in the future,
+  /// resume the granted state and countdown timer; if it's in the past (or
+  /// missing), clear it so we fall through to the normal schedule.
+  Future<void> restoreGrantState() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      _grantsUsedTonight = prefs.getInt(_grantsUsedKey) ?? 0;
+      _grantedMinutesTonight = prefs.getInt(_grantedMinutesKey) ?? 0;
+      final expiryMs = prefs.getInt(_grantExpiryKey);
+      if (expiryMs == null) return;
+
+      final expiry = DateTime.fromMillisecondsSinceEpoch(expiryMs);
+      if (expiry.isAfter(DateTime.now())) {
+        _grantExpiry = expiry;
+        _state = LockdownState.granted;
+        onStateChange(_state);
+        _startGrantTimer();
+      } else {
+        _grantExpiry = null;
+        await prefs.remove(_grantExpiryKey);
+      }
+    } catch (_) {}
+  }
+
+  void _startGrantTimer() {
+    _grantTimer?.cancel();
+    _grantTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      final remaining = grantRemaining;
+      if (remaining == null || remaining <= Duration.zero) {
+        _grantTimer?.cancel();
+        _grantExpiry = null;
+        unawaited(_persistGrantState());
+        _updateState();
+        onGrantExpired?.call();
+      } else {
+        onGrantTick?.call(remaining);
+      }
+    });
   }
 
   void stop() {
@@ -82,6 +148,7 @@ class LockdownScheduler {
       _grantedMinutesTonight = 0;
       _windDownNotified = false;
       _lockdownNotified = false;
+      unawaited(_persistGrantState());
     }
   }
 
@@ -95,6 +162,7 @@ class LockdownScheduler {
     if (_grantExpiry != null && !now.isBefore(_grantExpiry!)) {
       _grantExpiry = null;
       _grantTimer?.cancel();
+      unawaited(_persistGrantState());
     }
 
     if (_permanentlyUnlocked) {
@@ -116,6 +184,7 @@ class LockdownScheduler {
     _permanentlyUnlocked = true;
     _state = LockdownState.unlocked;
     onStateChange(_state);
+    unawaited(_persistGrantState());
   }
 
   void grantExtension(int minutes) {
@@ -125,19 +194,9 @@ class LockdownScheduler {
     _grantExpiry = DateTime.now().add(Duration(minutes: safeMinutes));
     _state = LockdownState.granted;
     onStateChange(_state);
+    unawaited(_persistGrantState());
 
-    _grantTimer?.cancel();
-    _grantTimer = Timer.periodic(const Duration(seconds: 1), (_) {
-      final remaining = grantRemaining;
-      if (remaining == null || remaining <= Duration.zero) {
-        _grantTimer?.cancel();
-        _grantExpiry = null;
-        _updateState();
-        onGrantExpired?.call();
-      } else {
-        onGrantTick?.call(remaining);
-      }
-    });
+    _startGrantTimer();
   }
 
   Future<void> _logSleepIfNeeded() async {
