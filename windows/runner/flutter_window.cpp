@@ -5,25 +5,48 @@
 #include <vector>
 
 #include "flutter/generated_plugin_registrant.h"
+#include "sleep_lock_state.h"
 
 HHOOK FlutterWindow::keyboard_hook_ = nullptr;
+HWINEVENTHOOK FlutterWindow::foreground_hook_ = nullptr;
 HWND FlutterWindow::app_window_ = nullptr;
 
 namespace {
-constexpr wchar_t kLockFlagFilename[] = L"sleep_time.locked";
 
-bool HasLockFlag() {
-  wchar_t temp_path[MAX_PATH];
-  DWORD path_length = GetTempPathW(MAX_PATH, temp_path);
-  if (path_length == 0 || path_length > MAX_PATH) {
+// Safety-net re-read interval for lock.json. The latency-sensitive case
+// (foreign window stealing focus) is handled by the SetWinEventHook below; this
+// timer only catches missed events / external edits, so it can be slow.
+constexpr UINT kLockStatePollMs = 5000;
+
+// Whether lockdown is currently active per lock.json (cheap, fail-open).
+bool IsLockActive() {
+  return sleeplock::Read().locked;
+}
+
+// In grant mode, decide whether |hwnd| is an allowed foreground window we must
+// NOT snap away from. In full mode (or when not in grant), nothing foreign is
+// allowed. Our OWN window is always "allowed" so we never fight ourselves.
+bool ShouldAllowForeground(HWND hwnd, HWND own_window) {
+  if (hwnd == nullptr) {
     return false;
   }
-
-  std::wstring full_path(temp_path);
-  full_path += kLockFlagFilename;
-  DWORD attributes = GetFileAttributesW(full_path.c_str());
-  return attributes != INVALID_FILE_ATTRIBUTES &&
-         !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+  if (hwnd == own_window) {
+    return true;
+  }
+  const sleeplock::LockState state = sleeplock::Read();
+  if (!state.locked) {
+    return true;  // not locked: never reclaim
+  }
+  if (!state.mode_grant) {
+    return false;  // full lock: everything foreign is disallowed
+  }
+  // Grant mode: resolve the owning process image. If we cannot resolve it (e.g.
+  // a protected / elevated process) we fail SAFE and reclaim.
+  const std::wstring image = sleeplock::ProcessImageForWindow(hwnd);
+  if (image.empty()) {
+    return false;
+  }
+  return sleeplock::IsAllowed(image, state.allow);
 }
 
 bool IsBlockedKey(const KBDLLHOOKSTRUCT* key) {
@@ -79,7 +102,9 @@ bool FlutterWindow::OnCreate() {
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
   app_window_ = GetHandle();
-  SetTimer(app_window_, lock_state_timer_id_, 250, nullptr);
+  // Demoted from the old 250ms hot loop to a 5s safety-net poll; the
+  // SetWinEventHook handles instant focus reclaim.
+  SetTimer(app_window_, lock_state_timer_id_, kLockStatePollMs, nullptr);
   UpdateLockState();
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() { this->Show(); });
@@ -97,6 +122,7 @@ void FlutterWindow::OnDestroy() {
     KillTimer(app_window_, lock_state_timer_id_);
   }
   RemoveKeyboardHook();
+  RemoveForegroundHook();
 
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -107,7 +133,7 @@ void FlutterWindow::OnDestroy() {
 }
 
 void FlutterWindow::UpdateLockState() {
-  const bool should_lock = IsLockFlagPresent();
+  const bool should_lock = IsLockActive();
   if (should_lock == native_lock_active_) {
     return;
   }
@@ -115,21 +141,50 @@ void FlutterWindow::UpdateLockState() {
   native_lock_active_ = should_lock;
   if (native_lock_active_) {
     InstallKeyboardHook();
+    InstallForegroundHook();
     RefocusAppWindow();
   } else {
     RemoveKeyboardHook();
+    RemoveForegroundHook();
   }
 }
 
-bool FlutterWindow::IsLockFlagPresent() const {
-  return HasLockFlag();
-}
-
+// Reclaim foreground to our own window. This is the highest-risk detail: a
+// background thread / process cannot freely steal foreground on modern Windows
+// unless we attach our input queue to the current foreground thread first.
+//
+// Sequence (all best-effort, all no-throw):
+//   1. Find the current foreground window's thread.
+//   2. AttachThreadInput(foreground -> us, TRUE) so SetForegroundWindow is
+//      honored.
+//   3. ShowWindow + SetForegroundWindow + SetWindowPos(HWND_TOPMOST).
+//   4. Detach.
+// We cannot beat a HIGHER integrity (elevated) foreground window — that case is
+// documented as defeatable in windows_lockdown.dart.
 void FlutterWindow::RefocusAppWindow() noexcept {
-  if (app_window_ != nullptr) {
-    ShowWindow(app_window_, SW_SHOW);
-    SetForegroundWindow(app_window_);
-    SetFocus(app_window_);
+  if (app_window_ == nullptr) {
+    return;
+  }
+  const HWND foreground = GetForegroundWindow();
+  const DWORD our_thread = GetCurrentThreadId();
+  DWORD foreground_thread = 0;
+  bool attached = false;
+  if (foreground != nullptr && foreground != app_window_) {
+    foreground_thread = GetWindowThreadProcessId(foreground, nullptr);
+    if (foreground_thread != 0 && foreground_thread != our_thread) {
+      attached = AttachThreadInput(foreground_thread, our_thread, TRUE) != FALSE;
+    }
+  }
+
+  ShowWindow(app_window_, SW_SHOW);
+  SetForegroundWindow(app_window_);
+  SetFocus(app_window_);
+  // Pin above other top-most windows without resizing/moving.
+  SetWindowPos(app_window_, HWND_TOPMOST, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+  if (attached) {
+    AttachThreadInput(foreground_thread, our_thread, FALSE);
   }
 }
 
@@ -148,14 +203,56 @@ void FlutterWindow::RemoveKeyboardHook() {
   }
 }
 
+void FlutterWindow::InstallForegroundHook() {
+  if (foreground_hook_ != nullptr) {
+    return;
+  }
+  // Out-of-context + skip-own-process: we are only notified when a window from
+  // ANOTHER process becomes foreground, which is exactly when we may need to
+  // reclaim. WINEVENT_OUTOFCONTEXT means the callback runs on our thread via
+  // the message loop (no DLL injection).
+  foreground_hook_ = SetWinEventHook(
+      EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, WinEventProc, 0,
+      0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+void FlutterWindow::RemoveForegroundHook() {
+  if (foreground_hook_ != nullptr) {
+    UnhookWinEvent(foreground_hook_);
+    foreground_hook_ = nullptr;
+  }
+}
+
+void CALLBACK FlutterWindow::WinEventProc(HWINEVENTHOOK /*hook*/, DWORD event,
+                                          HWND hwnd, LONG /*id_object*/,
+                                          LONG /*id_child*/,
+                                          DWORD /*event_thread*/,
+                                          DWORD /*event_time*/) noexcept {
+  if (event != EVENT_SYSTEM_FOREGROUND) {
+    return;
+  }
+  // Only act while locked, and only when the new foreground is not allowed.
+  if (!IsLockActive()) {
+    return;
+  }
+  if (ShouldAllowForeground(hwnd, app_window_)) {
+    return;  // grant mode: let an allowed app stay foreground.
+  }
+  RefocusAppWindow();
+}
+
 LRESULT CALLBACK FlutterWindow::KeyboardProc(int nCode, WPARAM wparam,
                                              LPARAM lparam) noexcept {
-  if (nCode >= 0 && HasLockFlag() &&
+  if (nCode >= 0 && IsLockActive() &&
       (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN ||
        wparam == WM_KEYUP || wparam == WM_SYSKEYUP)) {
     const auto* key = reinterpret_cast<KBDLLHOOKSTRUCT*>(lparam);
     if (IsBlockedKey(key)) {
-      RefocusAppWindow();
+      // In grant mode, if an allowed app currently holds the foreground, do not
+      // yank it away on a blocked-key event — just swallow the key.
+      if (!ShouldAllowForeground(GetForegroundWindow(), app_window_)) {
+        RefocusAppWindow();
+      }
       return 1;
     }
   }

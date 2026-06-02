@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'config.dart';
@@ -20,6 +21,11 @@ class LockdownScheduler {
   Timer? _ticker;
   Timer? _grantTimer;
   DateTime? _grantExpiry;
+
+  /// When non-empty, the active grant is a *selective* per-app grant (M2): the
+  /// overlay stays armed and only these image names are allowed through. Empty
+  /// for a full grant. Persisted so a crash mid-selective-grant restores.
+  List<String> _grantAllow = const [];
   int _grantsUsedTonight = 0;
   int _grantedMinutesTonight = 0;
   bool _windDownNotified = false;
@@ -38,10 +44,16 @@ class LockdownScheduler {
   final void Function(Duration remaining)? onGrantTick;
   final void Function()? onGrantExpired;
 
+  /// Called when a selective (per-app) grant starts. The host wires this to the
+  /// platform layer (e.g. [WindowsLockdown.grantSelective]). [allow] is the
+  /// resolved image-name allow-list; [minutes] is the sanitized duration.
+  final void Function(List<String> allow, int minutes)? onSelectiveGrant;
+
   LockdownScheduler({
     required this.onStateChange,
     this.onGrantTick,
     this.onGrantExpired,
+    this.onSelectiveGrant,
   });
 
   // Pref keys for persisting grant state across restarts so a crash
@@ -49,10 +61,22 @@ class LockdownScheduler {
   static const _grantExpiryKey = 'grant_expiry_ms';
   static const _grantsUsedKey = 'grants_used_tonight';
   static const _grantedMinutesKey = 'granted_minutes_tonight';
+  static const _grantAllowKey = 'grant_allow_images';
 
   LockdownState get state => _state;
   int get grantsUsedTonight => _grantsUsedTonight;
   DateTime? get grantExpiry => _grantExpiry;
+
+  /// The active selective-grant allow-list (image names). Empty when the active
+  /// grant is a full grant or there's no grant.
+  List<String> get grantAllow => List.unmodifiable(_grantAllow);
+
+  /// True when the active grant is a selective per-app grant (vs a full grant).
+  bool get isSelectiveGrant => _grantExpiry != null && _grantAllow.isNotEmpty;
+
+  /// Exposed for tests only: a selective grant must NEVER permanently unlock.
+  @visibleForTesting
+  bool get permanentlyUnlocked => _permanentlyUnlocked;
 
   Duration? get grantRemaining {
     if (_grantExpiry == null) return null;
@@ -81,8 +105,10 @@ class LockdownScheduler {
       if (_grantExpiry != null) {
         await prefs.setInt(
             _grantExpiryKey, _grantExpiry!.millisecondsSinceEpoch);
+        await prefs.setStringList(_grantAllowKey, _grantAllow);
       } else {
         await prefs.remove(_grantExpiryKey);
+        await prefs.remove(_grantAllowKey);
       }
       await prefs.setInt(_grantsUsedKey, _grantsUsedTonight);
       await prefs.setInt(_grantedMinutesKey, _grantedMinutesTonight);
@@ -103,12 +129,23 @@ class LockdownScheduler {
       final expiry = DateTime.fromMillisecondsSinceEpoch(expiryMs);
       if (expiry.isAfter(DateTime.now())) {
         _grantExpiry = expiry;
+        _grantAllow = prefs.getStringList(_grantAllowKey) ?? const [];
         _state = LockdownState.granted;
         onStateChange(_state);
+        // Re-arm a selective grant's platform allow-list after a crash so the
+        // overlay restores in the correct (grant) mode rather than full lock.
+        if (_grantAllow.isNotEmpty) {
+          onSelectiveGrant?.call(
+            _grantAllow,
+            expiry.difference(DateTime.now()).inMinutes.clamp(1, 1 << 30),
+          );
+        }
         _startGrantTimer();
       } else {
         _grantExpiry = null;
+        _grantAllow = const [];
         await prefs.remove(_grantExpiryKey);
+        await prefs.remove(_grantAllowKey);
       }
     } catch (_) {}
   }
@@ -120,6 +157,7 @@ class LockdownScheduler {
       if (remaining == null || remaining <= Duration.zero) {
         _grantTimer?.cancel();
         _grantExpiry = null;
+        _grantAllow = const [];
         unawaited(_persistGrantState());
         _updateState();
         onGrantExpired?.call();
@@ -167,6 +205,7 @@ class LockdownScheduler {
       unawaited(_logSleepIfNeeded());
       _grantsUsedTonight = 0;
       _grantedMinutesTonight = 0;
+      _grantAllow = const [];
       _windDownNotified = false;
       _lockdownNotified = false;
       _activeLockdownStart = null;
@@ -185,6 +224,7 @@ class LockdownScheduler {
 
     if (_grantExpiry != null && !now.isBefore(_grantExpiry!)) {
       _grantExpiry = null;
+      _grantAllow = const [];
       _grantTimer?.cancel();
       unawaited(_persistGrantState());
     }
@@ -205,6 +245,7 @@ class LockdownScheduler {
   void fullUnlock() {
     _grantTimer?.cancel();
     _grantExpiry = null;
+    _grantAllow = const [];
     _permanentlyUnlocked = true;
     _state = LockdownState.unlocked;
     onStateChange(_state);
@@ -215,9 +256,28 @@ class LockdownScheduler {
     final safeMinutes = AppConfig.sanitizeGrantedMinutes(minutes);
     _grantsUsedTonight++;
     _grantedMinutesTonight += safeMinutes;
+    _grantAllow = const [];
     _grantExpiry = DateTime.now().add(Duration(minutes: safeMinutes));
     _state = LockdownState.granted;
     onStateChange(_state);
+    unawaited(_persistGrantState());
+
+    _startGrantTimer();
+  }
+
+  /// Selective per-app grant (M2). Like [grantExtension] it enters the granted
+  /// state with a countdown, but it carries an [allow] image-name list and does
+  /// NOT permanently unlock — the overlay stays armed and re-locks on expiry.
+  /// The host's [onSelectiveGrant] wires this to the platform layer.
+  void grantSelective({required List<String> allow, required int minutes}) {
+    final safeMinutes = AppConfig.sanitizeGrantedMinutes(minutes);
+    _grantsUsedTonight++;
+    _grantedMinutesTonight += safeMinutes;
+    _grantAllow = List.unmodifiable(allow);
+    _grantExpiry = DateTime.now().add(Duration(minutes: safeMinutes));
+    _state = LockdownState.granted;
+    onStateChange(_state);
+    onSelectiveGrant?.call(_grantAllow, safeMinutes);
     unawaited(_persistGrantState());
 
     _startGrantTimer();

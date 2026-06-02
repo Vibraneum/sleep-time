@@ -8,6 +8,7 @@ import '../core/negotiation_engine.dart';
 import '../core/config.dart';
 import '../core/schedule_store.dart';
 import '../platform/windows_lockdown.dart';
+import '../platform/windows_lock_state.dart';
 import 'negotiation_chat.dart';
 import 'home_screen.dart';
 import 'settings_screen.dart';
@@ -58,14 +59,33 @@ class _LockdownScreenState extends State<LockdownScreen>
     setState(() => _showChat = false);
   }
 
-  Future<void> _onMinimize() async {
-    widget.scheduler.grantExtension(30);
+  Future<void> _onMinimize(int minutes) async {
+    // Use the guardian's real granted minutes (fall back to a small default if
+    // the model omitted a duration). Previously hardcoded to 30 (M1 note).
+    final grantMinutes = minutes > 0 ? minutes : AppConfig.minGrantedMinutes;
+    widget.scheduler.grantExtension(grantMinutes);
     await WindowsLockdown.deactivate();
     if (Platform.isWindows && !AppConfig.simulateLockdown) {
       try {
         await windowManager.minimize();
       } catch (_) {}
     }
+  }
+
+  /// Selective per-app unlock: keep the overlay armed but allow [identifier]
+  /// (a friendly name or image name) for [minutes]. Resolution to an image
+  /// name happens in [WindowsLockdown] via the scheduler's onSelectiveGrant.
+  void _onUnlockApp(String identifier, int minutes) {
+    final allow = WindowsAppResolver.resolveAll([identifier]);
+    final grantMinutes = minutes > 0 ? minutes : AppConfig.minGrantedMinutes;
+    if (allow.isEmpty) {
+      // Nothing resolvable — degrade to a normal timed grant rather than
+      // silently doing nothing.
+      widget.scheduler.grantExtension(grantMinutes);
+      return;
+    }
+    widget.scheduler.grantSelective(allow: allow, minutes: grantMinutes);
+    setState(() => _showChat = false);
   }
 
   Future<void> _onClose() async {
@@ -357,6 +377,7 @@ class _LockdownScreenState extends State<LockdownScreen>
             onMinimize: _onMinimize,
             onClose: _onClose,
             onUnlock: _onUnlock,
+            onUnlockApp: _onUnlockApp,
             onAdjustSchedule: _onAdjustSchedule,
           ),
         ),

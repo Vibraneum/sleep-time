@@ -6,7 +6,7 @@ class NegotiationChat extends StatefulWidget {
   final NegotiationEngine engine;
   final int grantsUsedTonight;
   final void Function(int minutes) onGranted;
-  final void Function()? onMinimize;
+  final void Function(int minutes)? onMinimize;
   final void Function()? onClose;
   final void Function()? onUnlock;
   final void Function(String identifier, int minutes)? onUnlockApp;
@@ -131,7 +131,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
           case GuardianAction.grant:
             widget.onGranted(decision.minutesGranted);
           case GuardianAction.minimize:
-            widget.onMinimize?.call();
+            widget.onMinimize?.call(decision.minutesGranted);
           case GuardianAction.close:
             widget.onClose?.call();
           case GuardianAction.unlock:

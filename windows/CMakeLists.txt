@@ -72,6 +72,11 @@ endif()
 set(INSTALL_BUNDLE_DATA_DIR "${CMAKE_INSTALL_PREFIX}/data")
 set(INSTALL_BUNDLE_LIB_DIR "${CMAKE_INSTALL_PREFIX}")
 
+# Sibling watchdog exe. Added here (after CMAKE_INSTALL_PREFIX is finalized) so
+# its install() lands next to the runner. Part of the ALL target, so the release
+# build fails if the watchdog does not compile.
+add_subdirectory("watchdog")
+
 install(TARGETS ${BINARY_NAME} RUNTIME DESTINATION "${CMAKE_INSTALL_PREFIX}"
   COMPONENT Runtime)
 

@@ -34,6 +34,12 @@ class _HomeScreenState extends State<HomeScreen> {
         setState(() => _grantRemaining = null);
         _onStateChange(LockdownState.locked);
       },
+      onSelectiveGrant: (allow, minutes) => unawaited(
+        WindowsLockdown.grantSelective(
+          allowImageNames: allow,
+          durationMinutes: minutes,
+        ),
+      ),
     );
     _scheduler.start();
   }
@@ -57,7 +63,11 @@ class _HomeScreenState extends State<HomeScreen> {
         await AndroidLockdown.activate();
         break;
       case LockdownState.granted:
-        await WindowsLockdown.grantExtension();
+        // A selective (per-app) grant keeps the overlay armed via
+        // onSelectiveGrant → grantSelective; only a FULL grant fully restores.
+        if (!_scheduler.isSelectiveGrant) {
+          await WindowsLockdown.grantExtension();
+        }
         await AndroidLockdown.grantExtension();
         break;
       case LockdownState.unlocked:

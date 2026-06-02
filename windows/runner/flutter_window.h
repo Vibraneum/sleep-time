@@ -25,12 +25,21 @@ class FlutterWindow : public Win32Window {
 
  private:
   void UpdateLockState();
-  bool IsLockFlagPresent() const;
   void InstallKeyboardHook();
   void RemoveKeyboardHook();
+  void InstallForegroundHook();
+  void RemoveForegroundHook();
+
+  // Reclaim foreground to our own window. Static so the hooks (which run with
+  // no `this`) can call it. No-throw.
   static void RefocusAppWindow() noexcept;
+
   static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wparam,
                                        LPARAM lparam) noexcept;
+  // SetWinEventHook callback: fires when the system foreground window changes.
+  static void CALLBACK WinEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd,
+                                    LONG id_object, LONG id_child,
+                                    DWORD event_thread, DWORD event_time) noexcept;
 
   // The project to run.
   flutter::DartProject project_;
@@ -42,6 +51,7 @@ class FlutterWindow : public Win32Window {
   UINT_PTR lock_state_timer_id_ = 1;
 
   static HHOOK keyboard_hook_;
+  static HWINEVENTHOOK foreground_hook_;
   static HWND app_window_;
 };
 
