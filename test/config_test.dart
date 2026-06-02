@@ -69,4 +69,66 @@ void main() {
           'claude-opus-4-8');
     });
   });
+
+  group('AppConfig.resolveActiveProvider', () {
+    test('saved gemini + only anthropic usable -> anthropic', () {
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.gemini,
+          anthropicUsable: true,
+          geminiUsable: false,
+        ),
+        AiProvider.anthropic,
+      );
+    });
+
+    test('saved anthropic + only gemini usable -> gemini', () {
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.anthropic,
+          anthropicUsable: false,
+          geminiUsable: true,
+        ),
+        AiProvider.gemini,
+      );
+    });
+
+    test('both usable -> keep saved', () {
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.gemini,
+          anthropicUsable: true,
+          geminiUsable: true,
+        ),
+        AiProvider.gemini,
+      );
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.anthropic,
+          anthropicUsable: true,
+          geminiUsable: true,
+        ),
+        AiProvider.anthropic,
+      );
+    });
+
+    test('neither usable -> keep saved', () {
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.gemini,
+          anthropicUsable: false,
+          geminiUsable: false,
+        ),
+        AiProvider.gemini,
+      );
+      expect(
+        AppConfig.resolveActiveProvider(
+          saved: AiProvider.anthropic,
+          anthropicUsable: false,
+          geminiUsable: false,
+        ),
+        AiProvider.anthropic,
+      );
+    });
+  });
 }

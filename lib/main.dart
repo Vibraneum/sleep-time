@@ -61,12 +61,14 @@ Future<void> _loadConfig({SecureKeyStore? secureKeyStore}) async {
     envName: 'GEMINI_API_KEY',
     compileTimeValue: _geminiKeyCompileTime,
   );
+  var anthropicFromEnv = false;
   AppConfig.anthropicApiKey = await _importSecret(
     store: secureStore,
     prefs: prefs,
     key: SecureKeyStore.anthropicApiKey,
     envName: 'ANTHROPIC_API_KEY',
     compileTimeValue: _anthropicKeyCompileTime,
+    onSource: (source) => anthropicFromEnv = source == KeyImportSource.env,
   );
   AppConfig.pokeApiKey = await _importSecret(
     store: secureStore,
@@ -84,6 +86,37 @@ Future<void> _loadConfig({SecureKeyStore? secureKeyStore}) async {
       AppConfig.aiProvider = provider;
       break;
     }
+  }
+
+  // Never run a provider that has no key when the other one is usable, and
+  // honor a freshly-seeded Anthropic key over a stale saved preference. This
+  // guards against the real failure mode where a saved `ai_provider == gemini`
+  // ran the Gemini text-parser path even though only an Anthropic key was
+  // present — the model emitted tool-calls as text that never executed.
+  final savedProvider = AppConfig.aiProvider;
+  final anthropicUsable = AppConfig.anthropicApiKey.trim().isNotEmpty;
+  final geminiUsable = AppConfig.effectiveGeminiApiKey.trim().isNotEmpty;
+
+  // Rule A (intent): an Anthropic key arriving via the env seed path, or an
+  // Anthropic key present while the saved provider can't run, means the user
+  // wants Anthropic.
+  final savedProviderUsable = savedProvider == AiProvider.anthropic
+      ? anthropicUsable
+      : geminiUsable;
+  if (anthropicUsable && (anthropicFromEnv || !savedProviderUsable)) {
+    AppConfig.aiProvider = AiProvider.anthropic;
+  } else {
+    // Rule B (general safety): if the active provider has no key but the other
+    // one does, switch to whichever has a key.
+    AppConfig.aiProvider = AppConfig.resolveActiveProvider(
+      saved: savedProvider,
+      anthropicUsable: anthropicUsable,
+      geminiUsable: geminiUsable,
+    );
+  }
+
+  if (AppConfig.aiProvider != savedProvider) {
+    await prefs.setString('ai_provider', AppConfig.aiProvider.name);
   }
 
   AppConfig.geminiModel =
@@ -142,6 +175,7 @@ Future<String> _importSecret({
   required String key,
   required String envName,
   required String compileTimeValue,
+  void Function(KeyImportSource source)? onSource,
 }) async {
   final decision = resolveKeyImport(
     secureValue: await store.read(key),
@@ -149,6 +183,8 @@ Future<String> _importSecret({
     legacyPrefValue: prefs.getString(key),
     compileTimeValue: compileTimeValue,
   );
+
+  onSource?.call(decision.source);
 
   switch (decision.source) {
     case KeyImportSource.env:

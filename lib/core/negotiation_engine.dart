@@ -281,9 +281,40 @@ class NegotiationEngine {
     final memoryContext = await MemoryService.buildNegotiationContext();
     final now = DateTime.now();
     final currentLocalTime = AppConfig.formatDateTimeWithZone(now);
-    final runtimeMode = AppConfig.isLockdownTime(now)
-        ? 'real lockdown'
-        : 'manual chat opened outside lockdown schedule';
+    final onSchedule = AppConfig.isLockdownTime(now);
+    // Authoritative framing: this chat is ONLY reachable while the screen is
+    // locked or in a grant, so if the guardian is talking to the user at all,
+    // the user is locked out RIGHT NOW — possibly via a manual "sleep now" the
+    // user triggered themselves, which is independent of the bedtime schedule
+    // and the wall clock. This holds even when `lockdownActive` hasn't been set
+    // yet and even when the clock falls outside the scheduled window.
+    final runtimeMode = StringBuffer()
+      ..writeln(
+          'YOU ARE CURRENTLY HOLDING THE USER LOCKED OUT. This conversation is '
+          'only reachable while the screen is locked or in a grant — so if you '
+          'are reading this, the user is locked out RIGHT NOW.')
+      ..writeln(
+          'The lock may be a scheduled bedtime lockdown OR a manual "sleep now" '
+          'the user triggered themselves; a manual lock is independent of the '
+          'bedtime schedule and the wall clock, so it can be active at any hour.')
+      ..writeln(
+          'NEVER tell the user "there\'s no lock", "nothing to turn off", or '
+          '"i\'m off duty" while in this chat — you ARE actively enforcing a '
+          'lock.')
+      ..writeln(
+          'You always have the power to release them: guardian_action grant '
+          '(frees the machine for N minutes), unlock_app (frees one app), or '
+          'end_session (lifts the lock for the night). Whether you release is '
+          'your judgment.')
+      ..write(onSchedule
+          ? 'Schedule context: the current time is inside the scheduled bedtime '
+              'lockdown window.'
+          : 'Schedule context: the current time is OUTSIDE the scheduled bedtime '
+              'window, so this is almost certainly a manual "sleep now" lock.');
+    if (lockdownActive) {
+      runtimeMode.write(
+          ' (Confirmed: the lockdown screen reports the lock is active.)');
+    }
 
     final base = '''
 $_personalityPrompt
@@ -296,7 +327,8 @@ $memoryContext
 
 CURRENT LOCAL WALL CLOCK: $currentLocalTime
 IMPORTANT: treat the local wall clock above as authoritative. if it says PM, do not call it AM. if it says evening, do not pretend it is morning.
-current mode: $runtimeMode
+current mode:
+$runtimeMode
 active provider: ${AppConfig.providerLabel}
 active model: ${AppConfig.activeModel}
 lockdown window: ${AppConfig.formatTime(AppConfig.lockdownHour, AppConfig.lockdownMinute)} - ${AppConfig.formatTime(AppConfig.unlockHour, AppConfig.unlockMinute)}

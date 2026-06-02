@@ -132,6 +132,30 @@ class AppConfig {
 
   static bool get hasUsableAiKey => activeApiKey.trim().isNotEmpty;
 
+  /// Pick the provider to actually run with, given the [saved] preference and
+  /// which providers currently hold a usable key. Pure + side-effect free so it
+  /// can be unit-tested and reasoned about in isolation.
+  ///
+  /// Rule: never run a provider that has no key when the other one is usable.
+  /// If the saved provider can't run but the other can, switch to the other.
+  /// Otherwise (saved is usable, both usable, or neither usable) keep [saved].
+  static AiProvider resolveActiveProvider({
+    required AiProvider saved,
+    required bool anthropicUsable,
+    required bool geminiUsable,
+  }) {
+    final savedUsable =
+        saved == AiProvider.anthropic ? anthropicUsable : geminiUsable;
+    if (savedUsable) return saved;
+    if (saved == AiProvider.anthropic && geminiUsable) {
+      return AiProvider.gemini;
+    }
+    if (saved == AiProvider.gemini && anthropicUsable) {
+      return AiProvider.anthropic;
+    }
+    return saved;
+  }
+
   static int sanitizeGrantedMinutes(int minutes) {
     return minutes.clamp(minGrantedMinutes, maxGrantedMinutes);
   }
