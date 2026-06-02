@@ -1,12 +1,15 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:sleep_time/core/lockdown_scheduler.dart';
+import 'package:sleep_time/core/schedule.dart';
+import 'package:sleep_time/core/schedule_store.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    ScheduleStore.resetForTest();
   });
 
   LockdownScheduler makeScheduler({
@@ -78,6 +81,31 @@ void main() {
       scheduler.grantExtension(10);
       expect(scheduler.isSelectiveGrant, isFalse);
       expect(scheduler.grantAllow, isEmpty);
+      scheduler.dispose();
+    });
+  });
+
+  group('M4: revert reentrancy guard', () {
+    test('a ScheduleStore notify during _updateState does not recurse', () {
+      // start() subscribes _onScheduleChanged -> _updateState to the store.
+      // revertTonightNudges() calls notifyListeners() synchronously, which
+      // re-enters _updateState through that subscription. The reentrancy guard
+      // must drop the nested call so this completes without a stack overflow.
+      final scheduler = makeScheduler();
+      scheduler.start();
+
+      // Seed a tonight nudge so revertTonightNudges() actually mutates + notifies.
+      ScheduleStore.instance.apply(
+        SleepSchedule.defaults.copyWith(lockdown: const ScheduleTime(23, 45)),
+        source: ScheduleSource.aiTonight,
+      );
+
+      // This notifies listeners; the guard prevents the nested _updateState
+      // from recursing. No exception / overflow == pass.
+      expect(ScheduleStore.instance.revertTonightNudges, returnsNormally);
+      expect(ScheduleStore.instance.current, SleepSchedule.defaults);
+
+      scheduler.stop();
       scheduler.dispose();
     });
   });

@@ -175,7 +175,23 @@ class LockdownScheduler {
     _grantTimer = null;
   }
 
+  /// Guards [_updateState] against synchronous re-entry. [revertTonightNudges]
+  /// calls `notifyListeners()` on the ScheduleStore, which re-enters
+  /// [_updateState] through [_onScheduleChanged]; this flag drops that nested
+  /// call so the revert can't recurse. Behavior is otherwise identical.
+  bool _inUpdateState = false;
+
   void _updateState() {
+    if (_inUpdateState) return;
+    _inUpdateState = true;
+    try {
+      _updateStateInner();
+    } finally {
+      _inUpdateState = false;
+    }
+  }
+
+  void _updateStateInner() {
     final previousState = _state;
     final newState = _computeState();
 

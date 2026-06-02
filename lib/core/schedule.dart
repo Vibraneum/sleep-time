@@ -46,6 +46,37 @@ class ScheduleValidation {
   const ScheduleValidation({required this.ok, required this.violations});
 }
 
+/// Shared, wrap-aware ordering check for a four-point schedule.
+///
+/// A coherent night progresses wakeUp -> windDown -> lockdown -> unlock as a
+/// single forward arc around the 24h circle, with the whole arc fitting inside
+/// one cycle (so it loops back to wakeUp without any boundary overtaking the
+/// next). This makes BOTH same-evening schedules (22:30/23:00/23:30/06:00) and
+/// cross-midnight ones (22:30/23:00/00:30/06:00) coherent, while genuinely
+/// scrambled orderings stay incoherent.
+///
+/// This is the single source of truth for ordering: [SleepSchedule.validate]
+/// and `ScheduleGuardrails._orderingOk` both call it so the two can never
+/// disagree about whether an ordering is sane. Range validity (0-23h/0-59m) is
+/// the caller's responsibility; this only looks at relative ordering.
+bool scheduleArcIsCoherent({
+  required int wakeUpMin,
+  required int windDownMin,
+  required int lockdownMin,
+  required int unlockMin,
+}) {
+  const dayMinutes = 24 * 60;
+  int forward(int to) => (to - wakeUpMin + dayMinutes) % dayMinutes;
+  // Forward distances from wakeUp to each subsequent boundary.
+  final toWind = forward(windDownMin);
+  final toLock = forward(lockdownMin);
+  final toUnlock = forward(unlockMin);
+  // A zero gap means a boundary collides with wakeUp; reject. Then require the
+  // arc to be strictly increasing and to close within one cycle.
+  if (toWind == 0 || toLock == 0 || toUnlock == 0) return false;
+  return toWind < toLock && toLock < toUnlock;
+}
+
 /// The full nightly schedule: when the guardian wakes, when to wind down,
 /// when lockdown begins, and when it lifts.
 class SleepSchedule {
@@ -105,19 +136,14 @@ class SleepSchedule {
   ///
   /// Range rules: every time must be a real wall-clock time (0-23h / 0-59m).
   ///
-  /// Ordering rules use **wrap-aware (cross-midnight) math**. The evening
-  /// build-up — wakeUp -> windDown -> lockdown — is expected to run in the
-  /// same evening, so we require those three to be non-decreasing in
-  /// minutes-of-day (e.g. 22:30 <= 23:00 <= 23:30).
-  ///
-  /// The lockdown -> unlock window legitimately crosses midnight (lockdown
-  /// 23:30, unlock 06:00). Because unlock is the *morning* end of the window,
-  /// it is NOT required to be numerically after lockdown. We only flag a
-  /// genuinely contradictory case: unlock landing back inside the evening
-  /// build-up (i.e. unlock at or after wakeUp on the same clock), which would
-  /// mean the lockdown window swallows the whole evening and never reaches a
-  /// distinct morning. Anything that resolves to a sane "lock tonight, unlock
-  /// tomorrow morning" window is accepted.
+  /// Ordering rules use **wrap-aware (cross-midnight) math** via the shared
+  /// [scheduleArcIsCoherent] helper. The night is treated as one forward arc
+  /// wakeUp -> windDown -> lockdown -> unlock around the 24h circle, so both a
+  /// same-evening schedule (22:30/23:00/23:30/06:00) and a cross-midnight one
+  /// (22:30/23:00/00:30/06:00) are accepted, while genuinely scrambled
+  /// orderings (e.g. windDown before wakeUp, lockdown before windDown, or
+  /// unlock collapsing onto lockdown) are rejected. The guardrails use the same
+  /// helper so the human Settings path and the AI path never disagree.
   ScheduleValidation validate() {
     final violations = <String>[];
 
@@ -137,38 +163,15 @@ class SleepSchedule {
 
     // Only evaluate ordering when every time is in range; otherwise
     // minutesOfDay math is meaningless.
-    if (violations.isEmpty) {
-      final wake = wakeUp.minutesOfDay;
-      final wind = windDown.minutesOfDay;
-      final lock = lockdown.minutesOfDay;
-      final unlockM = unlock.minutesOfDay;
-
-      // Evening build-up must be non-decreasing within the same evening.
-      if (wind < wake) {
-        violations.add('windDown must be at or after wakeUp');
-      }
-      if (lock < wind) {
-        violations.add('lockdown must be at or after windDown');
-      }
-
-      // Wrap-aware lockdown -> unlock check. Measure the length of the
-      // lockdown window walking forward (mod 24h). A zero-length window
-      // (unlock == lockdown) is contradictory; a window long enough to wrap
-      // back past wakeUp would swallow the evening entirely.
-      const dayMinutes = 24 * 60;
-      final lockWindow = (unlockM - lock + dayMinutes) % dayMinutes;
-      if (lockWindow == 0) {
-        violations.add('unlock must differ from lockdown');
-      } else {
-        // Distance from lockdown forward to wakeUp (the start of the next
-        // evening build-up). If the lockdown window is longer than that, the
-        // window has wrapped past the next wake time — contradictory.
-        final lockToWake = (wake - lock + dayMinutes) % dayMinutes;
-        if (lockToWake != 0 && lockWindow > lockToWake) {
-          violations.add('unlock falls after the next wakeUp; '
-              'the lockdown window swallows the evening');
-        }
-      }
+    if (violations.isEmpty &&
+        !scheduleArcIsCoherent(
+          wakeUpMin: wakeUp.minutesOfDay,
+          windDownMin: windDown.minutesOfDay,
+          lockdownMin: lockdown.minutesOfDay,
+          unlockMin: unlock.minutesOfDay,
+        )) {
+      violations.add('schedule ordering must progress wakeUp -> windDown -> '
+          'lockdown -> unlock around the clock');
     }
 
     return ScheduleValidation(ok: violations.isEmpty, violations: violations);

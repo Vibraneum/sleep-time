@@ -100,14 +100,32 @@ class _LockdownScreenState extends State<LockdownScreen>
       return;
     }
 
-    final allow = WindowsAppResolver.resolveAll([identifier]);
-    if (allow.isEmpty) {
-      // Nothing resolvable — degrade to a normal timed grant rather than
-      // silently doing nothing.
-      widget.scheduler.grantExtension(grantMinutes);
+    await _onUnlockAppWindows(identifier, grantMinutes);
+  }
+
+  Future<void> _onUnlockAppWindows(String identifier, int minutes) async {
+    // Gate on the user-approved negotiable-app set exactly like Android: the
+    // guardian may only selectively unlock apps the user explicitly approved in
+    // Settings. Without this gate WindowsAppResolver would turn ANY string into
+    // an `<input>.exe` and free an arbitrary process.
+    final approved = NegotiableAppStore.instance.resolve(identifier);
+    if (approved == null) {
+      // Not on the approved list (or unresolvable). Degrade to a normal full
+      // timed grant so the guardian's decision still does something honest,
+      // rather than freeing an unapproved process.
+      widget.scheduler.grantExtension(minutes);
       return;
     }
-    widget.scheduler.grantSelective(allow: allow, minutes: grantMinutes);
+
+    // Resolve the approved app's identifiers to Windows image name(s) for the
+    // overlay allow-list. Prefer the stored package (the user may have entered
+    // an image name there); fall back to the friendly label.
+    final allow = WindowsAppResolver.resolveAll([approved.package, approved.label]);
+    if (allow.isEmpty) {
+      widget.scheduler.grantExtension(minutes);
+      return;
+    }
+    widget.scheduler.grantSelective(allow: allow, minutes: minutes);
     setState(() => _showChat = false);
   }
 

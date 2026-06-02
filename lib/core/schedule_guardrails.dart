@@ -62,9 +62,19 @@ class NightlyAiBudget {
   /// add to this.
   final int cumulativeLockdownDelayMin;
 
+  /// Cumulative absolute drift (either direction) the AI has already applied to
+  /// wakeUp tonight vs the baseline, in minutes.
+  final int cumulativeWakeUpDriftMin;
+
+  /// Cumulative absolute drift (either direction) the AI has already applied to
+  /// windDown tonight vs the baseline, in minutes.
+  final int cumulativeWindDownDriftMin;
+
   const NightlyAiBudget({
     this.editsUsed = 0,
     this.cumulativeLockdownDelayMin = 0,
+    this.cumulativeWakeUpDriftMin = 0,
+    this.cumulativeWindDownDriftMin = 0,
   });
 }
 
@@ -92,6 +102,26 @@ class ScheduleGuardrails {
   /// Latest the AI may set unlock: 09:00.
   static const int unlockEnvelopeEndMin = 9 * 60; // 09:00
 
+  // NEEDS PRODUCT SIGN-OFF: the wakeUp / windDown envelopes below are first-pass
+  // guesses, like the lockdown/unlock ones. They cap how far the guardian can
+  // walk the *monitoring* and *wind-down* boundaries (including via permanent
+  // baseline edits, which are clamped to these too) so repeated nudges can't
+  // drift the whole evening earlier/later across nights.
+
+  /// Earliest the AI may set wakeUp (guardian wakes/monitors): 20:00.
+  static const int wakeUpEnvelopeStartMin = 20 * 60; // 20:00
+
+  /// Latest the AI may set wakeUp: 23:30.
+  static const int wakeUpEnvelopeEndMin = 23 * 60 + 30; // 23:30
+
+  /// Earliest the AI may set windDown: 20:30.
+  static const int windDownEnvelopeStartMin = 20 * 60 + 30; // 20:30
+
+  /// Latest the AI may set windDown: 00:30 next day. Stored as minutes past
+  /// midnight on the *following* day so the wrap-aware window 20:30..00:30 is a
+  /// single forward arc, mirroring the lockdown envelope encoding.
+  static const int windDownEnvelopeEndMin = 24 * 60 + 30; // 00:30 (+1 day)
+
   // --- Per-nudge and cumulative caps --------------------------------------
 
   /// A single AI nudge may move a field at most this many minutes from the
@@ -101,6 +131,12 @@ class ScheduleGuardrails {
   /// Total AI-applied *delay* to lockdown across the night may not exceed this
   /// many minutes vs the baseline.
   static const int maxCumulativeLockdownDelayMin = 90;
+
+  /// Total AI-applied *drift* (in either direction) to wakeUp or windDown
+  /// across the night may not exceed this many minutes vs the baseline. Mirrors
+  /// the lockdown cumulative cap so repeated nudges can't walk the evening
+  /// monitoring/wind-down boundaries arbitrarily. NEEDS PRODUCT SIGN-OFF.
+  static const int maxCumulativeWindowDriftMin = 90;
 
   /// Maximum number of AI schedule edits per night.
   static const int maxAiEditsPerNight = 3;
@@ -168,28 +204,32 @@ class ScheduleGuardrails {
       minutesOfDay >= unlockEnvelopeStartMin &&
       minutesOfDay <= unlockEnvelopeEndMin;
 
-  /// Wrap-aware ordering check for an AI candidate schedule.
-  ///
-  /// Unlike [SleepSchedule.validate], whose evening build-up rules assume the
-  /// wakeUp/windDown/lockdown trio all fall in the same evening (pre-midnight),
-  /// the guardrails deliberately allow lockdown to drift past midnight (up to
-  /// 01:00). So we walk the cycle as a forward arc starting at wakeUp and
-  /// require the boundaries to appear in order wakeUp -> windDown -> lockdown
-  /// -> unlock -> (back to wakeUp) without any one swallowing the next. Range
-  /// validity is already guaranteed before this is called.
-  static bool _orderingOk(SleepSchedule s) {
-    final wake = s.wakeUp.minutesOfDay;
-    int forward(int from, int to) => (to - from + _dayMinutes) % _dayMinutes;
-    // Forward distances from wakeUp to each subsequent boundary.
-    final toWind = forward(wake, s.windDown.minutesOfDay);
-    final toLock = forward(wake, s.lockdown.minutesOfDay);
-    final toUnlock = forward(wake, s.unlock.minutesOfDay);
-    // Each must be strictly increasing along the arc, and all within one cycle
-    // (i.e. unlock comes before we loop back to wakeUp). A zero gap means two
-    // boundaries collide, which we reject.
-    if (toWind == 0 || toLock == 0 || toUnlock == 0) return false;
-    return toWind < toLock && toLock < toUnlock;
+  static bool _withinWakeUpEnvelope(int minutesOfDay) =>
+      minutesOfDay >= wakeUpEnvelopeStartMin &&
+      minutesOfDay <= wakeUpEnvelopeEndMin;
+
+  /// True when [minutesOfDay], interpreted on the windDown 20:30..00:30 arc, is
+  /// inside the envelope. The arc wraps past midnight, so a value like 00:15
+  /// (=15) is mapped onto the +1-day axis (=1455) before the range check —
+  /// mirroring [_withinLockdownEnvelope].
+  static bool _withinWindDownEnvelope(int minutesOfDay) {
+    final wrapped = minutesOfDay < windDownEnvelopeStartMin
+        ? minutesOfDay + _dayMinutes
+        : minutesOfDay;
+    return wrapped >= windDownEnvelopeStartMin &&
+        wrapped <= windDownEnvelopeEndMin;
   }
+
+  /// Wrap-aware ordering check for an AI candidate schedule. Delegates to the
+  /// shared [scheduleArcIsCoherent] helper so the guardrails and
+  /// [SleepSchedule.validate] can never disagree about whether an ordering is
+  /// coherent. Range validity is already guaranteed before this is called.
+  static bool _orderingOk(SleepSchedule s) => scheduleArcIsCoherent(
+        wakeUpMin: s.wakeUp.minutesOfDay,
+        windDownMin: s.windDown.minutesOfDay,
+        lockdownMin: s.lockdown.minutesOfDay,
+        unlockMin: s.unlock.minutesOfDay,
+      );
 
   /// Evaluate one AI-proposed change. Pure — performs no I/O and mutates
   /// nothing.
@@ -281,6 +321,35 @@ class ScheduleGuardrails {
       }
     }
 
+    // --- Cumulative wakeUp / windDown drift cap --------------------------
+    // Drift in EITHER direction counts toward the cap so repeated nudges can't
+    // walk the monitoring / wind-down boundaries arbitrarily across the night.
+    if (field == 'wakeUp' || field == 'windDown') {
+      final alreadyDrifted = field == 'wakeUp'
+          ? budget.cumulativeWakeUpDriftMin
+          : budget.cumulativeWindDownDriftMin;
+      final proposedDrift = _wrapDelta(baseMin, proposedMin).abs();
+      if (proposedDrift > 0) {
+        final remaining = maxCumulativeWindowDriftMin - alreadyDrifted;
+        if (remaining <= 0) {
+          return GuardrailDecision(
+            outcome: GuardrailOutcome.rejected,
+            applied: current,
+            humanReason: '$field has already moved as far as it can tonight '
+                '(max ${maxCumulativeWindowDriftMin}min from baseline)',
+          );
+        }
+        if (proposedDrift > remaining) {
+          final signedDelta = _wrapDelta(baseMin, proposedMin);
+          final clampedDrift = signedDelta > 0 ? remaining : -remaining;
+          proposedMin = (baseMin + clampedDrift + _dayMinutes) % _dayMinutes;
+          clamped = true;
+          reasons.add('$field can move at most ${remaining}min more tonight '
+              '(${maxCumulativeWindowDriftMin}min nightly cap)');
+        }
+      }
+    }
+
     // --- Hard envelopes ---------------------------------------------------
     if (field == 'lockdown' && !_withinLockdownEnvelope(proposedMin)) {
       return GuardrailDecision(
@@ -294,6 +363,20 @@ class ScheduleGuardrails {
         outcome: GuardrailOutcome.rejected,
         applied: current,
         humanReason: 'wake-up must stay between 4:00 AM and 9:00 AM',
+      );
+    }
+    if (field == 'wakeUp' && !_withinWakeUpEnvelope(proposedMin)) {
+      return GuardrailDecision(
+        outcome: GuardrailOutcome.rejected,
+        applied: current,
+        humanReason: 'guardian wake time must stay between 8:00 PM and 11:30 PM',
+      );
+    }
+    if (field == 'windDown' && !_withinWindDownEnvelope(proposedMin)) {
+      return GuardrailDecision(
+        outcome: GuardrailOutcome.rejected,
+        applied: current,
+        humanReason: 'wind-down must stay between 8:30 PM and 12:30 AM',
       );
     }
 

@@ -52,6 +52,38 @@ void main() {
       expect(store.baseline, SleepSchedule.defaults);
     });
 
+    test('C1: aiTonight cross-midnight lockdown (23:30 -> 00:30) is granted',
+        () {
+      // Baseline lockdown 23:30 (the shipped default). An AI tonight nudge to
+      // 00:30 crosses midnight; with the wrap-aware validate() this MUST be
+      // granted and persisted to current (it was silently rejected before the
+      // C1a fix, while the engine still claimed success).
+      final store = ScheduleStore.instance;
+      final next = SleepSchedule.defaults.copyWith(
+        lockdown: const ScheduleTime(0, 30),
+      );
+      final result = store.apply(next, source: ScheduleSource.aiTonight);
+
+      expect(result.granted, isTrue, reason: result.reasons.join('; '));
+      expect(store.current.lockdown, const ScheduleTime(0, 30));
+      // aiTonight does not move the baseline.
+      expect(store.baseline.lockdown, const ScheduleTime(23, 30));
+    });
+
+    test('C1: a genuinely incoherent apply is rejected and leaves current',
+        () {
+      final store = ScheduleStore.instance;
+      // lockdown 22:45 lands before windDown 23:00 on the arc — incoherent.
+      final bad = SleepSchedule.defaults.copyWith(
+        lockdown: const ScheduleTime(22, 45),
+      );
+      final result = store.apply(bad, source: ScheduleSource.aiTonight);
+
+      expect(result.granted, isFalse);
+      expect(result.outcome, ScheduleOutcome.rejected);
+      expect(store.current, SleepSchedule.defaults);
+    });
+
     test('rejects an invalid change without mutating or notifying', () {
       final store = ScheduleStore.instance;
       var notified = 0;

@@ -231,4 +231,97 @@ void main() {
       expect(d.outcome, GuardrailOutcome.rejected);
     });
   });
+
+  group('H2: wakeUp / windDown hard envelopes', () {
+    test('rejects wakeUp earlier than the 20:00 floor', () {
+      // baseline wake 22:30; the ±60 clamp runs first, so use a baseline near
+      // the floor: 20:30, then ask 19:30 (-60) which lands below 20:00.
+      final earlyBaseline = SleepSchedule.defaults.copyWith(
+        wakeUp: const ScheduleTime(20, 30),
+      );
+      final d = ScheduleGuardrails.evaluate(
+        baseline: earlyBaseline,
+        current: earlyBaseline,
+        field: 'wakeUp',
+        hour: 19,
+        minute: 30,
+        scope: ScheduleScope.tonight,
+        budget: noBudget,
+        lockdownActive: false,
+      );
+      expect(d.outcome, GuardrailOutcome.rejected);
+    });
+
+    test('rejects windDown later than the 00:30 ceiling', () {
+      // baseline windDown 23:00; near the ceiling at 00:00, ask 01:00 (+60),
+      // past the 00:30 edge.
+      final lateBaseline = SleepSchedule.defaults.copyWith(
+        windDown: const ScheduleTime(0, 0),
+        lockdown: const ScheduleTime(0, 30),
+      );
+      final d = ScheduleGuardrails.evaluate(
+        baseline: lateBaseline,
+        current: lateBaseline,
+        field: 'windDown',
+        hour: 1,
+        minute: 0,
+        scope: ScheduleScope.tonight,
+        budget: noBudget,
+        lockdownActive: false,
+      );
+      expect(d.outcome, GuardrailOutcome.rejected);
+    });
+
+    test('permanent wakeUp edit is still envelope-clamped via ±60', () {
+      // A permanent-scope edit gets the same per-nudge clamp + envelope checks;
+      // asking wakeUp 19:00 (-210) clamps to 21:30 (-60), inside the envelope.
+      final d = check(
+        field: 'wakeUp',
+        hour: 19,
+        minute: 0,
+        scope: ScheduleScope.permanent,
+      );
+      expect(d.outcome, GuardrailOutcome.clamped);
+      expect(d.applied.wakeUp, const ScheduleTime(21, 30));
+    });
+  });
+
+  group('H2: cumulative wakeUp / windDown drift cap', () {
+    test('clamps wakeUp drift to whatever budget remains', () {
+      // Already drifted 70 of 90; ask for -60 more (22:30 -> 21:30). Only 20
+      // remains, so the result is baseline (22:30) - 20 = 22:10.
+      final d = check(
+        field: 'wakeUp',
+        hour: 21,
+        minute: 30,
+        budget:
+            const NightlyAiBudget(editsUsed: 1, cumulativeWakeUpDriftMin: 70),
+      );
+      expect(d.outcome, GuardrailOutcome.clamped);
+      expect(d.applied.wakeUp, const ScheduleTime(22, 10));
+    });
+
+    test('rejects further windDown drift once the cap is fully spent', () {
+      final d = check(
+        field: 'windDown',
+        hour: 23,
+        minute: 20,
+        budget: const NightlyAiBudget(
+            editsUsed: 2, cumulativeWindDownDriftMin: 90),
+      );
+      expect(d.outcome, GuardrailOutcome.rejected);
+    });
+
+    test('drift cap counts BOTH directions (later windDown also capped)', () {
+      // Already drifted 90; asking for a +20 later windDown is still rejected.
+      final d = check(
+        field: 'windDown',
+        hour: 23,
+        minute: 20,
+        budget: const NightlyAiBudget(
+            editsUsed: 1, cumulativeWindDownDriftMin: 90),
+      );
+      expect(d.outcome, GuardrailOutcome.rejected);
+    });
+  });
 }

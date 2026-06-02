@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../core/lockdown_scheduler.dart';
@@ -23,10 +24,26 @@ class _HomeScreenState extends State<HomeScreen> {
   LockdownState _currentState = LockdownState.unlocked;
   Duration? _grantRemaining;
 
+  /// Subscription to native Android guardian state events. Null off-Android.
+  StreamSubscription<AndroidGuardianEvent>? _androidEventSub;
+
+  /// True when the native alarm scheduler fell back to inexact alarms (the user
+  /// hasn't granted exact-alarm access). Surfaced as a dismissible banner.
+  bool _alarmsDegraded = false;
+  bool _degradedBannerDismissed = false;
+
   @override
   void initState() {
     super.initState();
     _complianceFuture = MemoryService.getComplianceRate();
+    if (Platform.isAndroid) {
+      _androidEventSub = AndroidLockdown.events().listen((event) {
+        if (!mounted) return;
+        if (event.degraded != _alarmsDegraded) {
+          setState(() => _alarmsDegraded = event.degraded);
+        }
+      });
+    }
     _scheduler = LockdownScheduler(
       onStateChange: _onStateChange,
       onGrantTick: (remaining) => setState(() => _grantRemaining = remaining),
@@ -89,6 +106,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
   @override
   void dispose() {
+    _androidEventSub?.cancel();
     _scheduler.dispose();
     super.dispose();
   }
@@ -107,6 +125,7 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 28),
               _buildStatusCard(),
               const SizedBox(height: 16),
+              _buildDegradedAlarmBanner(),
               _buildGuardianScheduleBanner(),
               _buildScheduleCard(),
               const SizedBox(height: 16),
@@ -287,6 +306,68 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Dismissible info banner shown when the native Android alarm scheduler had
+  /// to fall back to inexact alarms (no exact-alarm permission). Tells the user
+  /// lockdown timing may drift and links to settings to fix it.
+  Widget _buildDegradedAlarmBanner() {
+    if (!_alarmsDegraded || _degradedBannerDismissed) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFFF3E0),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.alarm_off_rounded,
+              color: Color(0xFFFF9500),
+              size: 20,
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Lockdown timing may drift',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFFC76B00),
+                    ),
+                  ),
+                  SizedBox(height: 2),
+                  Text(
+                    'Exact alarms are off, so lockdown may start a little late. '
+                    'Enable exact alarms in Settings to fix this.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFC76B00),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            GestureDetector(
+              onTap: () => setState(() => _degradedBannerDismissed = true),
+              child: const Icon(
+                Icons.close_rounded,
+                color: Color(0xFFC76B00),
+                size: 18,
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

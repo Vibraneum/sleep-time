@@ -250,14 +250,28 @@ class MemoryService {
   /// - `editsUsed`: number of applied AI schedule edits tonight.
   /// - `lockdownDelayMin`: summed *delay* (positive minutes) applied to the
   ///   lockdown field vs the value it had before each edit.
+  /// - `wakeUpDriftMin` / `windDownDriftMin`: summed absolute drift (either
+  ///   direction) applied to those fields tonight, for the cumulative window
+  ///   drift cap.
   ///
-  /// The new/old values are stored as `SleepSchedule.toMap().toString()`
-  /// snapshots; we recover the lockdown minutes-of-day from those strings with
-  /// a tolerant regex so a format tweak degrades to 0 rather than throwing.
-  static Future<({int editsUsed, int lockdownDelayMin})>
-      getTonightAiScheduleBudget() async {
+  /// Old/new values are read from the structured `field`/`old_value`/`new_value`
+  /// columns (stored as deterministic `HH:MM` by [ScheduleStore]); no regex on
+  /// a Dart map toString(). Fail-safe: any DB error yields a zero budget.
+  static Future<
+      ({
+        int editsUsed,
+        int lockdownDelayMin,
+        int wakeUpDriftMin,
+        int windDownDriftMin,
+      })> getTonightAiScheduleBudget() async {
+    const empty = (
+      editsUsed: 0,
+      lockdownDelayMin: 0,
+      wakeUpDriftMin: 0,
+      windDownDriftMin: 0,
+    );
     final db = await _safeDb;
-    if (db == null) return (editsUsed: 0, lockdownDelayMin: 0);
+    if (db == null) return empty;
     try {
       final tonight = DateTime.now().copyWith(
         hour: 22,
@@ -275,36 +289,48 @@ class MemoryService {
       );
       var editsUsed = 0;
       var lockdownDelayMin = 0;
+      var wakeUpDriftMin = 0;
+      var windDownDriftMin = 0;
+      const day = 24 * 60;
       for (final row in rows) {
         editsUsed++;
         final field = row['field'] as String?;
-        if (field != 'lockdown') continue;
-        final oldMin = _lockdownMinutesFromSnapshot(row['old_value'] as String?);
-        final newMin = _lockdownMinutesFromSnapshot(row['new_value'] as String?);
+        if (field == null) continue;
+        final oldMin = _minutesFromHhmm(row['old_value'] as String?);
+        final newMin = _minutesFromHhmm(row['new_value'] as String?);
         if (oldMin == null || newMin == null) continue;
         var delta = newMin - oldMin;
         // Wrap-aware shorter direction (e.g. 23:30 -> 00:15 = +45).
-        const day = 24 * 60;
         if (delta > day ~/ 2) delta -= day;
         if (delta < -day ~/ 2) delta += day;
-        if (delta > 0) lockdownDelayMin += delta;
+        switch (field) {
+          case 'lockdown':
+            if (delta > 0) lockdownDelayMin += delta;
+          case 'wakeUp':
+            wakeUpDriftMin += delta.abs();
+          case 'windDown':
+            windDownDriftMin += delta.abs();
+        }
       }
-      return (editsUsed: editsUsed, lockdownDelayMin: lockdownDelayMin);
+      return (
+        editsUsed: editsUsed,
+        lockdownDelayMin: lockdownDelayMin,
+        wakeUpDriftMin: wakeUpDriftMin,
+        windDownDriftMin: windDownDriftMin,
+      );
     } catch (_) {
-      return (editsUsed: 0, lockdownDelayMin: 0);
+      return empty;
     }
   }
 
-  /// Recover lockdown minutes-of-day from a `SleepSchedule.toMap().toString()`
-  /// snapshot. The snapshot looks like `{..., lockdown: {hour: 23, minute: 30},
-  /// ...}`. Returns null when it can't be parsed.
-  static int? _lockdownMinutesFromSnapshot(String? snapshot) {
-    if (snapshot == null) return null;
-    final match = RegExp(r'lockdown:\s*\{hour:\s*(\d+),\s*minute:\s*(\d+)\}')
-        .firstMatch(snapshot);
-    if (match == null) return null;
-    final h = int.tryParse(match.group(1) ?? '');
-    final m = int.tryParse(match.group(2) ?? '');
+  /// Parse a stored `HH:MM` audit value into minutes-of-day. Returns null when
+  /// the string is missing or malformed.
+  static int? _minutesFromHhmm(String? value) {
+    if (value == null) return null;
+    final parts = value.split(':');
+    if (parts.length != 2) return null;
+    final h = int.tryParse(parts[0]);
+    final m = int.tryParse(parts[1]);
     if (h == null || m == null) return null;
     return (h * 60) + m;
   }

@@ -161,11 +161,15 @@ class ScheduleStore extends ChangeNotifier {
     // Persist (fire-and-forget; swallow failures).
     _persist(next);
 
-    // Audit (fire-and-forget; swallow failures inside the service).
+    // Audit (fire-and-forget; swallow failures inside the service). Log the
+    // structured changed-field with deterministic HH:MM old/new values so the
+    // budget reader can parse them without regexing a Dart map toString().
+    final changed = _changedField(previous, next);
     MemoryService.logScheduleChange(
       source: source.name,
-      oldValue: previous.toMap().toString(),
-      newValue: next.toMap().toString(),
+      field: changed,
+      oldValue: changed == null ? null : _hhmm(_timeForField(previous, changed)),
+      newValue: changed == null ? null : _hhmm(_timeForField(next, changed)),
       reason: reason,
       outcome: ScheduleOutcome.granted.name,
     );
@@ -221,15 +225,53 @@ class ScheduleStore extends ChangeNotifier {
     _lastChangeSource = ScheduleSource.system;
     _lastChangeNote = 'reverted tonight\'s nudges to baseline';
     _persist(reverted);
+    final changed = _changedField(previous, reverted);
     MemoryService.logScheduleChange(
       source: ScheduleSource.system.name,
-      oldValue: previous.toMap().toString(),
-      newValue: reverted.toMap().toString(),
+      field: changed,
+      oldValue: changed == null ? null : _hhmm(_timeForField(previous, changed)),
+      newValue: changed == null ? null : _hhmm(_timeForField(reverted, changed)),
       reason: 'nightly revert of tonight nudges',
       outcome: ScheduleOutcome.granted.name,
     );
     notifyListeners();
   }
+
+  /// The single field that differs between [a] and [b], or null when zero or
+  /// more than one field changed. AI edits move exactly one field per apply, so
+  /// this names it for the audit log; a multi-field change (e.g. a full
+  /// userSettings save) logs a null field, which the budget reader ignores.
+  static String? _changedField(SleepSchedule a, SleepSchedule b) {
+    String? changed;
+    void note(String field, ScheduleTime x, ScheduleTime y) {
+      if (x == y) return;
+      changed = changed == null ? field : '__multi__';
+    }
+
+    note('wakeUp', a.wakeUp, b.wakeUp);
+    note('windDown', a.windDown, b.windDown);
+    note('lockdown', a.lockdown, b.lockdown);
+    note('unlock', a.unlock, b.unlock);
+    return changed == '__multi__' ? null : changed;
+  }
+
+  static ScheduleTime _timeForField(SleepSchedule s, String field) {
+    switch (field) {
+      case 'wakeUp':
+        return s.wakeUp;
+      case 'windDown':
+        return s.windDown;
+      case 'lockdown':
+        return s.lockdown;
+      case 'unlock':
+        return s.unlock;
+      default:
+        return s.lockdown;
+    }
+  }
+
+  static String _hhmm(ScheduleTime t) =>
+      '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
 
   Future<void> _persist(SleepSchedule s) async {
     try {

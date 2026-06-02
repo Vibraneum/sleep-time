@@ -481,6 +481,8 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     final budget = NightlyAiBudget(
       editsUsed: budgetRaw.editsUsed,
       cumulativeLockdownDelayMin: budgetRaw.lockdownDelayMin,
+      cumulativeWakeUpDriftMin: budgetRaw.wakeUpDriftMin,
+      cumulativeWindDownDriftMin: budgetRaw.windDownDriftMin,
     );
 
     final result = ScheduleGuardrails.evaluate(
@@ -494,20 +496,44 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       lockdownActive: lockdownActive,
     );
 
-    final appliedTime = result.applied;
-    final newField = _timeForField(appliedTime, field);
+    // The guardrails already rejected the proposal outright — nothing to apply.
+    if (result.outcome == GuardrailOutcome.rejected) {
+      _pendingToolResultAck =
+          'schedule change $field REJECTED (${result.humanReason})';
+      return decision.withScheduleOutcome(
+        'Change blocked: ${result.humanReason}',
+      );
+    }
+
+    // Guardrails granted or clamped: try to persist via the store. The store
+    // runs its OWN validation (wrap-aware ordering + ranges) and can still
+    // reject — e.g. a guardrail-approved candidate that doesn't survive
+    // validate(). We MUST honor the store's verdict rather than assume success:
+    // only emit GRANTED/CLAMPED when the store actually applied the change, and
+    // reflect the REAL persisted schedule (store.current) in the note.
+    final storeResult = store.apply(
+      result.applied,
+      source: scope == ScheduleScope.permanent
+          ? ScheduleSource.aiPermanent
+          : ScheduleSource.aiTonight,
+      reason: decision.scheduleReason,
+    );
+
+    if (!storeResult.granted) {
+      final why = storeResult.reasons.isNotEmpty
+          ? storeResult.reasons.join('; ')
+          : 'schedule rejected';
+      _pendingToolResultAck = 'schedule change $field REJECTED ($why)';
+      return decision.withScheduleOutcome('Change blocked: $why');
+    }
+
+    // Reflect the actually-persisted schedule, not the proposal.
+    final persistedField = _timeForField(storeResult.applied, field);
     final hhmm =
-        '${newField.hour.toString().padLeft(2, '0')}:${newField.minute.toString().padLeft(2, '0')}';
+        '${persistedField.hour.toString().padLeft(2, '0')}:${persistedField.minute.toString().padLeft(2, '0')}';
 
     switch (result.outcome) {
       case GuardrailOutcome.granted:
-        store.apply(
-          result.applied,
-          source: scope == ScheduleScope.permanent
-              ? ScheduleSource.aiPermanent
-              : ScheduleSource.aiTonight,
-          reason: decision.scheduleReason,
-        );
         _pendingToolResultAck = 'schedule change $field -> $hhmm: GRANTED';
         return decision.withScheduleOutcome(
           scope == ScheduleScope.permanent
@@ -515,13 +541,6 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
               : '$field moved to $hhmm tonight · back to baseline tomorrow',
         );
       case GuardrailOutcome.clamped:
-        store.apply(
-          result.applied,
-          source: scope == ScheduleScope.permanent
-              ? ScheduleSource.aiPermanent
-              : ScheduleSource.aiTonight,
-          reason: decision.scheduleReason,
-        );
         _pendingToolResultAck =
             'schedule change $field CLAMPED to $hhmm (${result.humanReason})';
         return decision.withScheduleOutcome(
@@ -530,6 +549,7 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
               : '$field set to $hhmm tonight (${result.humanReason})',
         );
       case GuardrailOutcome.rejected:
+        // Unreachable — handled above — but keep the switch exhaustive.
         _pendingToolResultAck =
             'schedule change $field REJECTED (${result.humanReason})';
         return decision.withScheduleOutcome(
