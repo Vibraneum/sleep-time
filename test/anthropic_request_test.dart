@@ -4,20 +4,24 @@ import 'package:sleep_time/core/negotiation_engine.dart';
 
 void main() {
   group('buildAnthropicToolRequest', () {
-    test('emits the 4 tools, tool_choice=any, no parallel tool use', () {
+    test('emits the tool set, tool_choice=any, no parallel tool use', () {
       final body = buildAnthropicToolRequest(
         systemPrompt: 'you are the guardian.',
         messages: const [],
       );
 
       final tools = body['tools'] as List<dynamic>;
-      expect(tools.length, 4);
+      expect(tools.length, 6);
 
       final names = tools.map((t) => (t as Map)['name']).toList();
+      // Stable, append-only order. end_session stays LAST so it carries the
+      // cache_control breakpoint (verified in the next test).
       expect(names, [
         'guardian_action',
         'unlock_app',
         'adjust_schedule',
+        'control_app',
+        'save_memory',
         'end_session',
       ]);
 

@@ -10,7 +10,9 @@ import 'package:sleep_time/platform/windows_lock_state.dart';
 ///
 /// The screen's `_onUnlockAppWindows` does:
 ///   1. `NegotiableAppStore.instance.resolve(identifier)` — null => NOT approved
-///      => fall back to a full timed grant (no arbitrary exe in the allow-list).
+///      => DENY (no grant). The old behavior fell back to a FULL grant, which
+///      freed the WHOLE machine when the store was empty — the opposite of a
+///      selective unlock (#7). It now denies with an explaining message instead.
 ///   2. only for an approved app, resolve its package/label to image name(s)
 ///      via [WindowsAppResolver.resolveAll] for the selective allow-list.
 ///
@@ -52,7 +54,7 @@ void main() {
       final approved = store.resolve('notepad');
       expect(approved, isNull,
           reason: 'unapproved app must not pass the gate, so the Windows path '
-              'falls back to a full grant and never builds an allow-list for it');
+              'DENIES (no grant) and never builds an allow-list for it');
 
       // Sanity: WindowsAppResolver alone WOULD have turned it into notepad.exe
       // (the very behavior the gate now prevents from reaching grantSelective).

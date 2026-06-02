@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import '../core/config.dart';
 import '../core/negotiation_engine.dart';
@@ -12,6 +14,23 @@ class NegotiationChat extends StatefulWidget {
   final void Function(String identifier, int minutes)? onUnlockApp;
   final void Function(GuardianDecision decision)? onAdjustSchedule;
 
+  /// Block+minimize / allow a distraction. Never terminates a process.
+  final void Function(String identifier, String action)? onControlApp;
+
+  /// Optional externally-owned focus node for the chat TextField. When the host
+  /// (LockdownScreen) supplies this, it can re-request keyboard focus on
+  /// onWindowFocus after a native foreground reclaim so typing is never lost.
+  final FocusNode? inputFocusNode;
+
+  /// True when this chat opens after a grant (the overlay is in a live grant).
+  /// Shows a "clock running" banner but keeps the input enabled — the chat is
+  /// continuous and unlimited.
+  final bool grantActive;
+
+  /// Optional tap target to open Settings from the chat header path. Used so a
+  /// user trapped behind a missing API key can configure it without escaping.
+  final void Function()? onOpenSettings;
+
   const NegotiationChat({
     super.key,
     required this.engine,
@@ -22,6 +41,10 @@ class NegotiationChat extends StatefulWidget {
     this.onUnlock,
     this.onUnlockApp,
     this.onAdjustSchedule,
+    this.onControlApp,
+    this.inputFocusNode,
+    this.grantActive = false,
+    this.onOpenSettings,
   });
 
   @override
@@ -36,40 +59,121 @@ class _ChatMessage {
   /// bubble describing the real outcome of an adjust_schedule call.
   final String? scheduleNote;
 
-  _ChatMessage({required this.text, required this.isUser, this.scheduleNote});
+  /// System messages render as a centered banner (e.g. "guardian offline —
+  /// configure API key") with an inline action, not a guardian chat bubble.
+  final bool isSystem;
+
+  _ChatMessage({
+    required this.text,
+    required this.isUser,
+    this.scheduleNote,
+    this.isSystem = false,
+  });
 }
 
 class _NegotiationChatState extends State<NegotiationChat> {
   final _controller = TextEditingController();
   final _scrollController = ScrollController();
-  final _focusNode = FocusNode();
+
+  /// Owned only when the host did not supply one. When the host supplies
+  /// [widget.inputFocusNode] we use that and must NOT dispose it.
+  FocusNode? _ownFocusNode;
+  FocusNode get _focusNode =>
+      widget.inputFocusNode ?? (_ownFocusNode ??= FocusNode());
+
   final List<_ChatMessage> _messages = [];
   bool _isLoading = false;
+
+  /// A TRUE end of the conversation: only the safe word and a guardian
+  /// end_session/close freeze the input. A grant / minimize / app-unlock keeps
+  /// the chat live and continuous (unlimited chat), so the user can keep
+  /// negotiating without re-opening a fresh session that has no recall.
   bool _negotiationOver = false;
+
+  /// Count of consecutive offline / missing-key guardian replies. After a
+  /// threshold we offer a graceful degraded release so the user isn't trapped.
+  int _offlineStreak = 0;
+  static const int _offlineReleaseThreshold = 3;
+  bool _degradedReleaseOffered = false;
+
+  /// 60s heartbeat for the proactive silence ping. The guardian gets a "brain
+  /// of its own": if the chat is open, idle, and the user hasn't spoken in a
+  /// while, it nudges — at most once per [_silencePingThrottle] so it never
+  /// spams.
+  Timer? _heartbeat;
+  static const Duration _silenceAfter = Duration(minutes: 3);
+  static const Duration _silencePingThrottle = Duration(minutes: 3);
 
   @override
   void initState() {
     super.initState();
     _startSession();
+    _heartbeat =
+        Timer.periodic(const Duration(seconds: 60), (_) => _maybeSilencePing());
+  }
+
+  /// Fire a proactive silence ping when the chat is open, idle, the user has
+  /// spoken at least once, and they've been silent past [_silenceAfter] — but
+  /// not more than once per [_silencePingThrottle]. Never hits the network when
+  /// there's no usable key (it uses the canned fallback then).
+  Future<void> _maybeSilencePing() async {
+    if (!mounted || _isLoading || _negotiationOver) return;
+    final lastUser = widget.engine.lastUserMessageAt;
+    if (lastUser == null) return; // never nudge before the user has spoken
+    if (DateTime.now().difference(lastUser) < _silenceAfter) return;
+    final lastProactive = widget.engine.lastProactiveAt;
+    if (lastProactive != null &&
+        DateTime.now().difference(lastProactive) < _silencePingThrottle) {
+      return;
+    }
+    setState(() => _isLoading = true);
+    try {
+      final decision =
+          await widget.engine.negotiateProactive(ProactiveTrigger.silence);
+      if (!mounted) return;
+      setState(() {
+        _messages.add(_ChatMessage(text: decision.message, isUser: false));
+        _isLoading = false;
+      });
+      _scrollToBottom();
+    } catch (_) {
+      if (mounted) setState(() => _isLoading = false);
+    }
   }
 
   Future<void> _startSession() async {
     setState(() => _isLoading = true);
     try {
       await widget.engine.startSession();
-      // The first response from startSession is the greeting
-      final greeting = widget.engine.sessionId.isNotEmpty
-          ? _getGreeting()
-          : "set your gemini api key in settings.";
-      _messages.add(_ChatMessage(text: greeting, isUser: false));
+      if (widget.engine.sessionId.isEmpty || !AppConfig.hasUsableAiKey) {
+        // No usable key: render a real system banner (with a Settings shortcut)
+        // instead of a dead guardian bubble that can only repeat itself.
+        _messages.add(_ChatMessage(
+          text: 'guardian offline — no api key configured.',
+          isUser: false,
+          isSystem: true,
+        ));
+        setState(() => _isLoading = false);
+        return;
+      }
+      // The opening line is REAL model output (a proactive guardian turn)
+      // through the same tool loop — not a hardcoded string. Falls back to a
+      // canned line only if the proactive call fails.
+      final decision =
+          await widget.engine.negotiateProactive(ProactiveTrigger.open);
+      _messages.add(_ChatMessage(text: decision.message, isUser: false));
     } catch (_) {
-      _messages.add(
-          _ChatMessage(text: "couldn't connect. check your api key.", isUser: false));
+      _messages.add(_ChatMessage(text: _fallbackGreeting(), isUser: false));
     }
-    setState(() => _isLoading = false);
+    if (mounted) {
+      setState(() => _isLoading = false);
+      _scrollToBottom();
+    }
   }
 
-  String _getGreeting() {
+  /// Safe fallback opening line used only when the proactive model call cannot
+  /// run (offline / no key). The live path uses real model output.
+  String _fallbackGreeting() {
     if (widget.grantsUsedTonight == 0) {
       return "it's past your bedtime. what's so important it can't wait?";
     } else if (widget.grantsUsedTonight == 1) {
@@ -124,38 +228,54 @@ class _NegotiationChatState extends State<NegotiationChat> {
         ));
         _isLoading = false;
       });
+      _trackOfflineStreak(decision);
 
-      // adjustSchedule stays in chat (like deny) — application is M3.
-      final isTerminal = decision.action != GuardianAction.none &&
-          decision.action != GuardianAction.deny &&
-          decision.action != GuardianAction.adjustSchedule;
+      // A HARD end (only close / unlock == end_session) freezes the input. A
+      // grant / minimize / app-unlock is NOT a hard end — the chat stays live
+      // and continuous so the user can keep negotiating (unlimited chat). The
+      // host still gets the callback to apply the grant; the chat re-opens onto
+      // the SAME engine, so history survives grant -> relock -> re-open.
+      final isHardEnd = decision.action == GuardianAction.close ||
+          decision.action == GuardianAction.unlock;
 
-      if (isTerminal) {
+      if (isHardEnd) {
         _negotiationOver = true;
         await Future.delayed(const Duration(seconds: 2));
+        if (decision.action == GuardianAction.close) {
+          widget.onClose?.call();
+        } else {
+          widget.onUnlock?.call();
+        }
+      } else {
         switch (decision.action) {
           case GuardianAction.grant:
+            await Future.delayed(const Duration(seconds: 2));
             widget.onGranted(decision.minutesGranted);
           case GuardianAction.minimize:
+            await Future.delayed(const Duration(seconds: 2));
             widget.onMinimize?.call(decision.minutesGranted);
-          case GuardianAction.close:
-            widget.onClose?.call();
-          case GuardianAction.unlock:
-            widget.onUnlock?.call();
           case GuardianAction.unlockApp:
+            await Future.delayed(const Duration(seconds: 2));
             widget.onUnlockApp?.call(
               decision.appIdentifier ?? '',
               decision.appMinutes ?? 0,
             );
+          case GuardianAction.adjustSchedule:
+            // The engine already ran the proposal through the guardrails and
+            // ScheduleStore before returning. We've shown the guardian's
+            // message and the truthful outcome chip; just notify the host (to
+            // refresh the schedule UI) and stay in the chat.
+            widget.onAdjustSchedule?.call(decision);
+          case GuardianAction.controlApp:
+            // Block+minimize / allow a distraction. Non-terminal — the chat
+            // stays live so the user can respond.
+            widget.onControlApp?.call(
+              decision.controlAppIdentifier ?? '',
+              decision.controlAppAction ?? 'minimize',
+            );
           default:
             break;
         }
-      } else if (decision.action == GuardianAction.adjustSchedule) {
-        // The engine already ran the proposal through the guardrails and
-        // ScheduleStore before returning. We've shown the guardian's message
-        // and the truthful outcome chip; just notify the host (to refresh the
-        // schedule UI) and stay in the chat — adjust_schedule is not terminal.
-        widget.onAdjustSchedule?.call(decision);
       }
     } catch (e) {
       setState(() {
@@ -166,7 +286,32 @@ class _NegotiationChatState extends State<NegotiationChat> {
     }
 
     _scrollToBottom();
-    _focusNode.requestFocus();
+    if (!_negotiationOver) _focusNode.requestFocus();
+  }
+
+  /// Track consecutive offline / missing-key replies. The engine returns a
+  /// `deny`-action bubble with one of its canned offline lines when it cannot
+  /// reach the model; after [_offlineReleaseThreshold] in a row we offer a
+  /// graceful degraded release so a no-key user isn't trapped (the only other
+  /// escape being the safe word).
+  void _trackOfflineStreak(GuardianDecision decision) {
+    final looksOffline = !AppConfig.hasUsableAiKey ||
+        decision.message == 'guardian is offline. try again.' ||
+        decision.message == 'something broke. try again.';
+    if (looksOffline) {
+      _offlineStreak++;
+    } else {
+      _offlineStreak = 0;
+    }
+    if (_offlineStreak >= _offlineReleaseThreshold && !_degradedReleaseOffered) {
+      _degradedReleaseOffered = true;
+      _messages.add(_ChatMessage(
+        text: 'guardian can\'t reach its brain right now. configure an API key '
+            'in settings, or release the lockdown for now.',
+        isUser: false,
+        isSystem: true,
+      ));
+    }
   }
 
   void _scrollToBottom() {
@@ -183,9 +328,12 @@ class _NegotiationChatState extends State<NegotiationChat> {
 
   @override
   void dispose() {
+    _heartbeat?.cancel();
     _controller.dispose();
     _scrollController.dispose();
-    _focusNode.dispose();
+    // Only dispose a focus node we created. A host-supplied node is owned by
+    // the host (LockdownScreen) and must outlive this widget.
+    _ownFocusNode?.dispose();
     super.dispose();
   }
 
@@ -193,6 +341,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
   Widget build(BuildContext context) {
     return Column(
       children: [
+        if (widget.grantActive) _buildClockRunningBanner(),
         Expanded(
           child: ListView.builder(
             controller: _scrollController,
@@ -271,7 +420,88 @@ class _NegotiationChatState extends State<NegotiationChat> {
     );
   }
 
+  /// A small "clock running" banner shown inside the chat while a grant is
+  /// live. The input stays enabled beneath it — the chat is continuous.
+  Widget _buildClockRunningBanner() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: const Color(0xFFFF9500).withAlpha(28),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.timer_outlined, size: 14, color: Color(0xFFFF9500)),
+          const SizedBox(width: 8),
+          Text(
+            'clock running — keep talking if you need more',
+            style: TextStyle(
+              color: const Color(0xFFFF9500).withAlpha(220),
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// System banner (centered) with the missing-key / degraded-release affordance
+  /// rather than a dead guardian bubble.
+  Widget _buildSystemMessage(_ChatMessage msg) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFF9500).withAlpha(24),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: const Color(0xFFFF9500).withAlpha(80)),
+        ),
+        child: Column(
+          children: [
+            Text(
+              msg.text,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: const Color(0xFFFFB95E),
+                fontSize: 13,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                TextButton.icon(
+                  onPressed: () => widget.onOpenSettings?.call(),
+                  icon: const Icon(Icons.settings_rounded,
+                      size: 16, color: Color(0xFFFFB95E)),
+                  label: const Text(
+                    'Go to Settings',
+                    style: TextStyle(color: Color(0xFFFFB95E), fontSize: 13),
+                  ),
+                ),
+                if (_degradedReleaseOffered) ...[
+                  const SizedBox(width: 8),
+                  TextButton.icon(
+                    onPressed: () => widget.onClose?.call(),
+                    icon: const Icon(Icons.lock_open_rounded,
+                        size: 16, color: Color(0xFFFFB95E)),
+                    label: const Text(
+                      'Release for now',
+                      style: TextStyle(color: Color(0xFFFFB95E), fontSize: 13),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildMessage(_ChatMessage msg) {
+    if (msg.isSystem) return _buildSystemMessage(msg);
     return Padding(
       padding: const EdgeInsets.only(bottom: 12),
       child: Row(

@@ -119,6 +119,87 @@ void main() {
       expect(d.message, 'go. handle it. do not abuse this.');
     });
 
+    test('control_app minimize maps to controlApp with the identifier', () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': 'discord',
+        'action': 'minimize',
+        'message': 'discord, away. you don\'t need it.',
+      });
+
+      expect(d.action, GuardianAction.controlApp);
+      expect(d.controlAppIdentifier, 'discord');
+      expect(d.controlAppAction, 'minimize');
+      expect(d.message, 'discord, away. you don\'t need it.');
+    });
+
+    test('control_app block normalizes to minimize (block + minimize, never kill)',
+        () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': 'chrome',
+        'action': 'block',
+        'message': 'no browsing.',
+      });
+
+      expect(d.action, GuardianAction.controlApp);
+      // 'block' is normalized to 'minimize' — we NEVER kill/terminate.
+      expect(d.controlAppAction, 'minimize');
+    });
+
+    test('control_app allow is preserved', () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': 'code',
+        'action': 'allow',
+        'message': 'fine, vscode only.',
+      });
+
+      expect(d.action, GuardianAction.controlApp);
+      expect(d.controlAppAction, 'allow');
+    });
+
+    test('control_app unknown action falls back to deny', () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': 'discord',
+        'action': 'nuke',
+        'message': 'gone.',
+      });
+
+      expect(d.action, GuardianAction.deny);
+      expect(d.message, 'no.');
+    });
+
+    test('control_app blank identifier falls back to deny', () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': '   ',
+        'action': 'minimize',
+        'message': 'away.',
+      });
+
+      expect(d.action, GuardianAction.deny);
+    });
+
+    test('save_memory carries type + text', () {
+      final d = guardianDecisionFromToolUse('save_memory', {
+        'memory_type': 'constraint',
+        'text': 'works night shifts wed/thu',
+        'message': 'noted.',
+      });
+
+      expect(d.action, GuardianAction.saveMemory);
+      expect(d.memoryType, 'constraint');
+      expect(d.memoryText, 'works night shifts wed/thu');
+      expect(d.message, 'noted.');
+    });
+
+    test('save_memory blank text falls back to deny', () {
+      final d = guardianDecisionFromToolUse('save_memory', {
+        'memory_type': 'preference',
+        'text': '   ',
+        'message': 'ok.',
+      });
+
+      expect(d.action, GuardianAction.deny);
+    });
+
     test('unknown tool falls back to deny', () {
       final d = guardianDecisionFromToolUse('teleport', {
         'message': 'beam me up.',
@@ -175,6 +256,46 @@ void main() {
 
       expect(decision.granted, isFalse);
       expect(decision.message, 'absolutely not.');
+    });
+  });
+
+  group('cleanGeminiResponse strips leaked action labels (#2)', () {
+    test('strips a bare "deny request" line', () {
+      final cleaned = cleanGeminiResponse('no. go to sleep.\ndeny request');
+      expect(cleaned, 'no. go to sleep.');
+    });
+
+    test('strips a bare standalone decision word', () {
+      final cleaned = cleanGeminiResponse('not happening.\ndeny');
+      expect(cleaned, 'not happening.');
+    });
+
+    test('strips a "Decision: deny" label line', () {
+      final cleaned = cleanGeminiResponse('morning you will thank me.\nDecision: deny');
+      expect(cleaned, 'morning you will thank me.');
+    });
+
+    test('strips a markdown "**Action:** grant" label line', () {
+      final cleaned =
+          cleanGeminiResponse('fine. five minutes.\n**Action:** grant');
+      expect(cleaned, 'fine. five minutes.');
+    });
+
+    test('strips "outcome = lock"', () {
+      final cleaned = cleanGeminiResponse('locking it down.\noutcome = lock');
+      expect(cleaned, 'locking it down.');
+    });
+
+    test('keeps legitimate prose that merely mentions a word', () {
+      // A sentence that contains "deny" mid-line is NOT a bare label and stays.
+      final cleaned =
+          cleanGeminiResponse("i'm not going to deny you forever, but no.");
+      expect(cleaned, "i'm not going to deny you forever, but no.");
+    });
+
+    test('collapses to "no." when only a label remains', () {
+      final cleaned = cleanGeminiResponse('deny request');
+      expect(cleaned, 'no.');
     });
   });
 }

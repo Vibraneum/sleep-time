@@ -263,6 +263,72 @@ class WindowsLockdown {
     _startWatchdogRespawnLoop();
   }
 
+  /// Critical processes the guardian may NEVER minimize/control. These keep the
+  /// desktop, session, and our own enforcement alive — minimizing them would
+  /// either be pointless or destabilize the machine. Lower-cased image names.
+  static const Set<String> criticalProcessSafelist = {
+    'explorer.exe',
+    'winlogon.exe',
+    'lsass.exe',
+    'csrss.exe',
+    'dwm.exe',
+    'sleep_time.exe',
+    'sleep_time_watchdog.exe',
+  };
+
+  /// True when [imageName] (friendly or image name) resolves to a critical
+  /// process we must refuse to control. Pure so it is unit-testable.
+  static bool isCriticalProcess(String imageName) {
+    final resolved = WindowsAppResolver.resolve(imageName);
+    if (resolved == null) return false;
+    return criticalProcessSafelist.contains(resolved.toLowerCase());
+  }
+
+  /// Block + MINIMIZE a distracting app's windows — NEVER kill/terminate (the
+  /// owner must not lose unsaved work). Resolves the friendly/image name, then
+  /// minimizes every top-level visible window owned by a matching process via a
+  /// no-window PowerShell helper (no FFI / no new pub deps). Refuses any process
+  /// on [criticalProcessSafelist]. Returns false when refused or off-Windows.
+  ///
+  /// This is the Dart-initiated counterpart to the native foreground reclaim in
+  /// flutter_window.cpp (which minimizes whatever foreign window grabs focus).
+  static Future<bool> minimizeApp(String imageName) async {
+    if (!Platform.isWindows) return false;
+    if (isCriticalProcess(imageName)) return false;
+    final resolved = WindowsAppResolver.resolve(imageName);
+    if (resolved == null) return false;
+    if (_simulating) {
+      if (kDebugMode) debugPrint('[sleep-time] simulate: minimizeApp $resolved');
+      return true;
+    }
+    // Strip the .exe for Get-Process (which wants the base name).
+    final procName = resolved.toLowerCase().endsWith('.exe')
+        ? resolved.substring(0, resolved.length - 4)
+        : resolved;
+    try {
+      // SW_MINIMIZE = 6. ShowWindowAsync is non-blocking and never terminates
+      // the target — it only minimizes the window, preserving unsaved work.
+      // Build the script line-by-line so the embedded here-string (@'...'@) and
+      // the procName interpolation stay readable.
+      final lines = <String>[
+        r"$sig = @'",
+        '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);',
+        "'@",
+        r'$t = Add-Type -MemberDefinition $sig -Name Win32Min -Namespace SleepTime -PassThru;',
+        'Get-Process -Name "$procName" -ErrorAction SilentlyContinue | '
+            r'ForEach-Object { if ($_.MainWindowHandle -ne 0) '
+            r'{ [void]$t::ShowWindowAsync($_.MainWindowHandle, 6) } }',
+      ];
+      await Process.run(
+        'powershell',
+        ['-NoProfile', '-Command', lines.join('\n')],
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Snap back to the full overlay (e.g. on selective-grant expiry).
   static Future<void> restoreFull() async {
     if (!Platform.isWindows) return;

@@ -113,6 +113,69 @@ class GuardianTools {
     },
   };
 
+  /// control_app — block + MINIMIZE (or re-allow) a distraction. NEVER kills or
+  /// terminates a process (the user must not lose unsaved work). The platform
+  /// layer minimizes non-allowed windows and reclaims foreground.
+  static const Map<String, dynamic> controlApp = {
+    'name': 'control_app',
+    'description':
+        'Block + minimize a distracting app, or re-allow one. This NEVER closes '
+        'or kills the app — it only pushes it out of the way (minimize) or stops '
+        'minimizing it (allow). Use it to quiet distractions during lockdown.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {
+        'app_identifier': {
+          'type': 'string',
+          'description': 'Friendly name or image name of the app to control.',
+        },
+        'action': {
+          'type': 'string',
+          'enum': ['block', 'minimize', 'allow'],
+        },
+        'message': {
+          'type': 'string',
+          'description': 'The user-facing reply. The ONLY text the user sees.',
+        },
+      },
+      'required': ['app_identifier', 'action', 'message'],
+    },
+  };
+
+  /// save_memory — persist a durable fact/pattern the guardian learned about the
+  /// user so future nights reference it (learns + remembers).
+  static const Map<String, dynamic> saveMemory = {
+    'name': 'save_memory',
+    'description':
+        'Remember a durable fact, pattern, preference, or constraint about the '
+        'user for future nights. Use sparingly for things worth carrying '
+        'forward, not chit-chat.',
+    'input_schema': {
+      'type': 'object',
+      'properties': {
+        'memory_type': {
+          'type': 'string',
+          'enum': [
+            'goal',
+            'mood',
+            'constraint',
+            'preference',
+            'openLoop',
+          ],
+        },
+        'text': {
+          'type': 'string',
+          'description': 'The fact to remember, in your own words.',
+        },
+        'message': {
+          'type': 'string',
+          'description': 'The user-facing reply. The ONLY text the user sees.',
+        },
+      },
+      'required': ['memory_type', 'text', 'message'],
+    },
+  };
+
   /// end_session — the deliberate, rare full-night release.
   static const Map<String, dynamic> endSession = {
     'name': 'end_session',
@@ -131,12 +194,18 @@ class GuardianTools {
     },
   };
 
-  /// The 4-tool set in stable order. The LAST tool carries the cache_control
-  /// breakpoint (added by the request builder, not here).
+  /// The tool set in stable order. The LAST tool carries the cache_control
+  /// breakpoint (added by the request builder, not here). ORDER IS STABLE:
+  /// changing it would invalidate the prompt cache, so new tools are APPENDED
+  /// before the trailing end_session anchor stays last is NOT required — the
+  /// builder stamps cache_control on whatever is last, so we just keep this list
+  /// append-only.
   static const List<Map<String, dynamic>> all = [
     guardianAction,
     unlockApp,
     adjustSchedule,
+    controlApp,
+    saveMemory,
     endSession,
   ];
 }
@@ -237,6 +306,39 @@ GuardianDecision guardianDecisionFromToolUse(
         scheduleReason: reason,
         scheduleScope: scope,
       );
+    case 'control_app':
+      final identifier = input['app_identifier'];
+      final action = (input['action'] as String?)?.toLowerCase();
+      // Fail CLOSED: an unknown action or blank identifier collapses to deny so
+      // we never push an invalid control instruction downstream.
+      if (identifier is! String ||
+          identifier.trim().isEmpty ||
+          !(action == 'block' || action == 'minimize' || action == 'allow')) {
+        return _denyFallback();
+      }
+      return GuardianDecision(
+        message: message,
+        action: GuardianAction.controlApp,
+        controlAppIdentifier: identifier,
+        // 'block' and 'minimize' are both "push it out of the way"; normalize
+        // 'block' -> 'minimize' so the platform layer has a single verb.
+        controlAppAction: action == 'block' ? 'minimize' : action,
+      );
+    case 'save_memory':
+      final text = input['text'];
+      final memoryType = input['memory_type'];
+      if (text is! String ||
+          text.trim().isEmpty ||
+          memoryType is! String ||
+          memoryType.trim().isEmpty) {
+        return _denyFallback();
+      }
+      return GuardianDecision(
+        message: message,
+        action: GuardianAction.saveMemory,
+        memoryType: memoryType,
+        memoryText: text,
+      );
     case 'end_session':
       return GuardianDecision(
         message: message,
@@ -306,6 +408,28 @@ GuardianDecision parseGeminiDecision(String response) {
   return GuardianDecision(message: cleanGeminiResponse(response));
 }
 
+/// Matches a BARE action/decision label line the Gemini model sometimes leaks
+/// next to (or instead of) its JSON decision object — e.g. `deny request`,
+/// `Decision: deny`, `**Action:** grant`, `outcome = lock`. These must never
+/// reach the chat bubble. Anchored to the whole (trimmed, lower-cased) line.
+final RegExp _bareActionLabel = RegExp(
+  r'^\*{0,2}(action|decision|result|outcome)\s*[:=]?\s*\*{0,2}\s*'
+  r'(grant|deny|lock|minimize|close|exit|unlock)(\s+request)?\*{0,2}$',
+);
+
+/// Exact bare keywords (no label prefix) that are pure decision leakage.
+const Set<String> _bareDecisionWords = {
+  'grant',
+  'deny',
+  'lock',
+  'minimize',
+  'close',
+  'exit',
+  'unlock',
+  'deny request',
+  'grant request',
+};
+
 @visibleForTesting
 String cleanGeminiResponse(String response) {
   final cleaned = response
@@ -313,7 +437,17 @@ String cleanGeminiResponse(String response) {
       .split('\n')
       .where((line) {
         final trimmed = line.trim();
-        return !(trimmed.startsWith('{') && trimmed.contains('"decision"'));
+        // 1. The JSON decision object line.
+        if (trimmed.startsWith('{') && trimmed.contains('"decision"')) {
+          return false;
+        }
+        // 2. A bare action-label line ("deny request", "Decision: deny",
+        //    "**Action:** grant", etc.) the model leaks alongside/without JSON.
+        final lower = trimmed.toLowerCase();
+        if (_bareActionLabel.hasMatch(lower)) return false;
+        // 3. A standalone bare decision keyword on its own line.
+        if (_bareDecisionWords.contains(lower)) return false;
+        return true;
       })
       .join('\n')
       .trim();

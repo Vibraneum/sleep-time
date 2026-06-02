@@ -21,7 +21,16 @@ enum GuardianAction {
   unlock,
   unlockApp,
   adjustSchedule,
+  controlApp,
+  saveMemory,
 }
+
+/// Synthetic triggers for an AI-initiated (proactive) turn. The guardian gets a
+/// "brain of its own": instead of only replying to the user it can open the
+/// conversation, ping after silence, warn before a grant expires, and nudge at
+/// wind-down. Each maps to a system-authored user turn pushed through the SAME
+/// Anthropic tool loop so the reply is real model output, not a hardcoded line.
+enum ProactiveTrigger { open, silence, grantExpiring, windDown }
 
 class GuardianDecision {
   final String message;
@@ -32,6 +41,15 @@ class GuardianDecision {
   final String? appIdentifier;
   final String? appLabel;
   final int? appMinutes;
+
+  // App-control payload (block + minimize distractions, never kill). Carried by
+  // the control_app tool so the guardian can proactively quiet a distraction.
+  final String? controlAppIdentifier;
+  final String? controlAppAction; // 'minimize' | 'allow'
+
+  // save_memory payload — a durable fact the guardian chose to remember.
+  final String? memoryType;
+  final String? memoryText;
 
   // Schedule-adjust payload. Application + guardrails landed in M3.
   final String? scheduleField;
@@ -52,6 +70,10 @@ class GuardianDecision {
     this.appIdentifier,
     this.appLabel,
     this.appMinutes,
+    this.controlAppIdentifier,
+    this.controlAppAction,
+    this.memoryType,
+    this.memoryText,
     this.scheduleField,
     this.scheduleHour,
     this.scheduleMinute,
@@ -69,6 +91,10 @@ class GuardianDecision {
         appIdentifier: appIdentifier,
         appLabel: appLabel,
         appMinutes: appMinutes,
+        controlAppIdentifier: controlAppIdentifier,
+        controlAppAction: controlAppAction,
+        memoryType: memoryType,
+        memoryText: memoryText,
         scheduleField: scheduleField,
         scheduleHour: scheduleHour,
         scheduleMinute: scheduleMinute,
@@ -171,7 +197,23 @@ class NegotiationEngine {
   String? _systemPrompt;
   String _sessionId = '';
 
+  /// Wall-clock time of the most recent USER message in this session. Used by
+  /// the LockdownScreen silence heartbeat to decide whether to ping. Null until
+  /// the user has said something (proactive turns do not count).
+  DateTime? _lastUserMessageAt;
+
+  /// Last time a proactive (AI-initiated) turn fired. Throttles the silence
+  /// ping so the guardian never spams.
+  DateTime? _lastProactiveAt;
+
+  /// When the current lock-night session started — used for the live "time
+  /// since start" memory delta.
+  DateTime? _sessionStartedAt;
+
   String get sessionId => _sessionId;
+
+  DateTime? get lastUserMessageAt => _lastUserMessageAt;
+  DateTime? get lastProactiveAt => _lastProactiveAt;
 
   Future<void> initialize() async {
     _personalityPrompt ??=
@@ -189,9 +231,23 @@ class NegotiationEngine {
     }
   }
 
-  Future<String> startSession() async {
+  /// Start (or RESUME) the lock-night session. Idempotent within a lock-night:
+  /// once a session exists we keep it so `_anthropicHistory` survives the
+  /// LockdownScreen lifecycle (grant -> relock spawns a fresh LockdownScreen,
+  /// but the engine is owned above it and persists). Pass [force]=true on the
+  /// nightly reset to deliberately start a brand-new session.
+  Future<String> startSession({bool force = false}) async {
     await initialize();
+
+    // Resume an existing session rather than wiping history. This is what makes
+    // the chat "unlimited + continuous": re-opening the chat after a grant does
+    // NOT re-greet from scratch or forget what was already said.
+    if (!force && _sessionId.isNotEmpty) {
+      return _sessionId;
+    }
+
     _sessionId = 'session_${DateTime.now().millisecondsSinceEpoch}';
+    _sessionStartedAt = DateTime.now();
     _anthropicHistory.clear();
     _lastToolUseId = null;
     _geminiChat = null;
@@ -259,7 +315,11 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
             'ending the negotiation.';
       case AiProvider.gemini:
         return 'When making a final grant/deny/lock decision, put the JSON decision '
-            'object on the last line.';
+            'object on the LAST line ONLY, e.g. {"decision":"deny"}. NEVER write '
+            'the decision word, an action label, or words like "deny request" / '
+            '"Decision: grant" / "Action: lock" anywhere else in your reply. Your '
+            'visible text is ONLY your in-character message — the decision lives '
+            'solely in that final JSON line.';
     }
   }
 
@@ -297,6 +357,8 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       await startSession();
     }
 
+    _lastUserMessageAt = DateTime.now();
+
     if (!AppConfig.hasUsableAiKey) {
       return GuardianDecision(message: _missingKeyMessage());
     }
@@ -328,6 +390,84 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     }
 
     return decision;
+  }
+
+  /// Synthetic-user prompts for each proactive trigger. These are authored as a
+  /// SYSTEM-tagged user turn so the model knows the user did NOT actually type
+  /// them (per personality.md's proactive section) and replies in character.
+  static String _proactivePrompt(ProactiveTrigger trigger) {
+    switch (trigger) {
+      case ProactiveTrigger.open:
+        return '[SYSTEM: the lockdown just opened and the user opened the chat. '
+            'send your opening line. be proactive and in character. do not wait '
+            'for them to speak first.]';
+      case ProactiveTrigger.silence:
+        return '[SYSTEM: the user has gone silent for a few minutes mid-chat. '
+            'nudge them once, in character — short. do not repeat yourself.]';
+      case ProactiveTrigger.grantExpiring:
+        return '[SYSTEM: the current grant expires in about 2 minutes and the '
+            'screen will re-lock. warn them once, in character — short.]';
+      case ProactiveTrigger.windDown:
+        return '[SYSTEM: it is wind-down time — lockdown starts soon. nudge the '
+            'user to start wrapping up, in character — short.]';
+    }
+  }
+
+  /// AI-initiated ("brain of its own") turn. Pushes a synthetic, SYSTEM-tagged
+  /// user turn through the SAME Anthropic tool loop so the guardian's opening
+  /// line / silence ping / grant-expiry warning / wind-down nudge is REAL model
+  /// output rendered as a guardian bubble — not a hardcoded string. Falls back
+  /// to a safe canned line only when offline / no key. Throttled by the caller.
+  Future<GuardianDecision> negotiateProactive(ProactiveTrigger trigger) async {
+    if (_sessionId.isEmpty) {
+      await startSession();
+    }
+    _lastProactiveAt = DateTime.now();
+
+    if (!AppConfig.hasUsableAiKey) {
+      return GuardianDecision(message: _proactiveFallback(trigger));
+    }
+
+    // Gemini fallback path has no tool loop; use a canned in-character line so
+    // we never block. The headline proactive experience is the Anthropic path.
+    if (AppConfig.aiProvider != AiProvider.anthropic) {
+      return GuardianDecision(message: _proactiveFallback(trigger));
+    }
+
+    final decision =
+        await _sendAnthropicToolUse(_proactivePrompt(trigger));
+
+    await MemoryService.saveMessage(ConversationMessage(
+      role: 'guardian',
+      content: decision.message,
+      sessionId: _sessionId,
+    ));
+    return decision;
+  }
+
+  String _proactiveFallback(ProactiveTrigger trigger) {
+    switch (trigger) {
+      case ProactiveTrigger.open:
+        if (lockdownActive) {
+          return "it's past your bedtime. what's so important it can't wait?";
+        }
+        return "i'm here. what do you need?";
+      case ProactiveTrigger.silence:
+        return 'still there? sleep is waiting.';
+      case ProactiveTrigger.grantExpiring:
+        return 'two minutes left. wrap it up.';
+      case ProactiveTrigger.windDown:
+        return 'start wrapping up. lockdown is close.';
+    }
+  }
+
+  /// Reset the session for a brand-new lock-night (clears history + last-message
+  /// tracking). The caller (host) invokes this on the nightly reset so a fresh
+  /// night doesn't carry the previous night's conversation.
+  Future<void> resetSession() async {
+    _lastUserMessageAt = null;
+    _lastProactiveAt = null;
+    await startSession(force: true);
   }
 
   Future<GuardianDecision> _sendToProvider(String userMessage) async {
@@ -370,10 +510,18 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     // succeeded and parsed — otherwise a timeout / non-2xx / bad-JSON leaves the
     // local session out of sync with the provider (a phantom user turn the API
     // never saw, and a discarded pending tool_result).
+    // Inject a small LIVE memory delta per turn (grant count, denials tonight,
+    // time since session start) rather than re-baking the cached system prompt
+    // — the cached system prompt stays byte-stable so the prompt cache keeps
+    // hitting, while the model still sees fresh state every turn.
+    final memoryDelta = await _buildMemoryDelta();
+    final turnText =
+        memoryDelta.isEmpty ? userMessage : '$memoryDelta\n\n$userMessage';
+
     final nextUserTurn = <String, dynamic>{
       'role': 'user',
       'content': buildUserTurnContent(
-        userMessage: userMessage,
+        userMessage: turnText,
         pendingToolUseId: _lastToolUseId,
         toolResultAck: _pendingToolResultAck,
       ),
@@ -453,7 +601,28 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     if (decision.action == GuardianAction.adjustSchedule) {
       return _applyScheduleAdjustment(decision);
     }
+    if (decision.action == GuardianAction.saveMemory) {
+      await _persistGuardianMemory(decision);
+      // save_memory is a side effect, not a UI action — present it like a deny
+      // (keep-talking) so the chat stays live and the guardian's message shows.
+      return GuardianDecision(
+        message: decision.message,
+        action: GuardianAction.deny,
+      );
+    }
     return decision;
+  }
+
+  /// Persist a guardian-authored memory. Best-effort; failures are swallowed to
+  /// match the rest of the persistence layer.
+  Future<void> _persistGuardianMemory(GuardianDecision decision) async {
+    final text = decision.memoryText;
+    if (text == null || text.trim().isEmpty) return;
+    final type = MemoryType.values.firstWhere(
+      (t) => t.name == decision.memoryType,
+      orElse: () => MemoryType.preference,
+    );
+    await MemoryService.saveMemory(MemoryItem(type: type, text: text));
   }
 
   /// Run an `adjust_schedule` proposal through the guardrails, apply it (or
@@ -576,6 +745,24 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         return s.unlock;
       default:
         return s.lockdown;
+    }
+  }
+
+  /// A short live state delta injected into each Anthropic user turn. Kept tiny
+  /// and prefixed so the model treats it as backend state, not user speech.
+  Future<String> _buildMemoryDelta() async {
+    try {
+      final grants = await MemoryService.getTonightGrantCount();
+      final negotiations = await MemoryService.getRecentNegotiations(days: 1);
+      final deniedTonight =
+          negotiations.where((n) => !n.granted).length;
+      final since = _sessionStartedAt == null
+          ? 0
+          : DateTime.now().difference(_sessionStartedAt!).inMinutes;
+      return '[MEMORY UPDATE: grants tonight=$grants, denials tonight='
+          '$deniedTonight, minutes since session start=$since]';
+    } catch (_) {
+      return '';
     }
   }
 

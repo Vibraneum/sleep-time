@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/config.dart';
 import '../core/memory_service.dart';
+import '../core/negotiation_engine.dart';
 import '../core/schedule_store.dart';
 import '../platform/android_lockdown.dart';
 import '../platform/windows_lockdown.dart';
@@ -22,6 +23,18 @@ class _HomeScreenState extends State<HomeScreen> {
   late Future<double> _complianceFuture;
   LockdownState _currentState = LockdownState.unlocked;
   Duration? _grantRemaining;
+
+  /// The negotiation engine is owned HERE, above the LockdownScreen lifecycle,
+  /// so its conversation history survives grant -> relock (which destroys and
+  /// rebuilds the LockdownScreen). A new LockdownScreen reuses the SAME engine,
+  /// and startSession() is idempotent within a lock-night — so re-opening the
+  /// chat after a grant recalls everything instead of re-greeting from scratch.
+  final NegotiationEngine _engine = NegotiationEngine();
+
+  /// Whether the previous lockdown state was a SELECTIVE (per-app) grant. Used
+  /// on re-lock to snap the overlay back to full screen (the corner HUD) — a
+  /// plain activate() no-ops while already "locked".
+  bool _wasSelectiveGrant = false;
 
   /// Subscription to native Android guardian state events. Null off-Android.
   StreamSubscription<AndroidGuardianEvent>? _androidEventSub;
@@ -45,10 +58,18 @@ class _HomeScreenState extends State<HomeScreen> {
     }
     _scheduler = LockdownScheduler(
       onStateChange: _onStateChange,
-      onGrantTick: (remaining) => setState(() => _grantRemaining = remaining),
+      onGrantTick: (remaining) {
+        setState(() => _grantRemaining = remaining);
+        // Wire the grant-expiry warning to a proactive guardian turn at ~2 min
+        // remaining (fires once per grant — guarded inside _maybeWarnExpiry).
+        _maybeWarnGrantExpiry(remaining);
+      },
       onGrantExpired: () {
+        // The scheduler's grant timer ALREADY recomputed to `locked` and
+        // emitted onStateChange(locked) before calling us. Re-emitting
+        // _onStateChange(locked) here caused a SECOND pushAndRemoveUntil and a
+        // double re-lock race. So we only clear the countdown label.
         setState(() => _grantRemaining = null);
-        _onStateChange(LockdownState.locked);
       },
       onSelectiveGrant: (allow, minutes) => unawaited(
         WindowsLockdown.grantSelective(
@@ -60,22 +81,65 @@ class _HomeScreenState extends State<HomeScreen> {
     _scheduler.start();
   }
 
+  /// Tracks whether the grant-expiry warning already fired for the current
+  /// grant so the proactive ping happens at most once per grant.
+  bool _grantExpiryWarned = false;
+
+  void _maybeWarnGrantExpiry(Duration remaining) {
+    if (remaining.inSeconds <= 0) {
+      _grantExpiryWarned = false;
+      return;
+    }
+    // Fire once in the 2-minute window. Reset above when the grant ends.
+    if (!_grantExpiryWarned &&
+        remaining.inSeconds <= 120 &&
+        remaining.inSeconds > 110) {
+      _grantExpiryWarned = true;
+      if (AppConfig.hasUsableAiKey) {
+        unawaited(_engine.negotiateProactive(ProactiveTrigger.grantExpiring));
+      }
+    }
+  }
+
   void _onStateChange(LockdownState state) {
     if (!mounted) return;
+    // Capture whether we are LEAVING a selective grant before we overwrite
+    // _currentState — used to decide whether re-lock must restoreFull().
+    final leavingSelectiveGrant =
+        _currentState == LockdownState.granted && _wasSelectiveGrant;
     setState(() {
       _currentState = state;
       if (state == LockdownState.unlocked) {
         _complianceFuture = MemoryService.getComplianceRate();
+        // Night over: reset the engine so tomorrow starts a fresh conversation,
+        // and clear the grant-expiry warning latch.
+        _grantExpiryWarned = false;
+        unawaited(_engine.resetSession());
+      }
+      if (state == LockdownState.granted) {
+        _wasSelectiveGrant = _scheduler.isSelectiveGrant;
+      } else if (state != LockdownState.granted) {
+        _wasSelectiveGrant = false;
       }
     });
-    unawaited(_syncPlatformLockdown(state));
+    unawaited(_syncPlatformLockdown(state, fromSelectiveGrant: leavingSelectiveGrant));
     if (state == LockdownState.locked) _showLockdownScreen();
   }
 
-  Future<void> _syncPlatformLockdown(LockdownState state) async {
+  Future<void> _syncPlatformLockdown(
+    LockdownState state, {
+    bool fromSelectiveGrant = false,
+  }) async {
     switch (state) {
       case LockdownState.locked:
-        await WindowsLockdown.activate();
+        // Re-locking after a SELECTIVE grant: the overlay is still "locked" (the
+        // armed corner HUD), so a plain activate() no-ops and the HUD never
+        // snaps back to full screen. restoreFull() forces the full overlay back.
+        if (fromSelectiveGrant) {
+          await WindowsLockdown.restoreFull();
+        } else {
+          await WindowsLockdown.activate();
+        }
         await AndroidLockdown.activate();
         break;
       case LockdownState.granted:
@@ -103,7 +167,10 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _showLockdownScreen() {
     Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => LockdownScreen(scheduler: _scheduler)),
+      MaterialPageRoute(
+        builder: (_) =>
+            LockdownScreen(scheduler: _scheduler, engine: _engine),
+      ),
       (route) => false,
     );
   }
@@ -112,6 +179,7 @@ class _HomeScreenState extends State<HomeScreen> {
   void dispose() {
     _androidEventSub?.cancel();
     _scheduler.dispose();
+    _engine.dispose();
     super.dispose();
   }
 

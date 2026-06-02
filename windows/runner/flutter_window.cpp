@@ -73,6 +73,31 @@ bool ShouldAllowForeground(HWND hwnd, HWND own_window) {
   return sleeplock::IsAllowed(image, state.allow);
 }
 
+// True when |hwnd| belongs to OUR OWN process. WINEVENT_SKIPOWNPROCESS does NOT
+// reliably skip intra-process child / IME windows on the foreground event, so a
+// focus reclaim could fire when (e.g.) Flutter's own text-input window takes
+// foreground — which would yank focus away from a TextField the user is typing
+// into. Guard with an explicit PID compare so we never fight ourselves.
+bool IsSameProcess(HWND hwnd) {
+  if (hwnd == nullptr) {
+    return false;
+  }
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  return pid != 0 && pid == GetCurrentProcessId();
+}
+
+// Best-effort minimize of a foreign window (block + minimize, NEVER kill). We
+// never terminate a process — the owner does not want to lose unsaved work, so
+// we only push the distraction out of the way before reclaiming foreground.
+// Refuses our own process so we never minimize ourselves.
+void MinimizeForeignWindow(HWND hwnd, HWND own_window) noexcept {
+  if (hwnd == nullptr || hwnd == own_window || IsSameProcess(hwnd)) {
+    return;
+  }
+  ShowWindow(hwnd, SW_MINIMIZE);
+}
+
 bool IsBlockedKey(const KBDLLHOOKSTRUCT* key) {
   if (!key) {
     return false;
@@ -202,7 +227,11 @@ void FlutterWindow::RefocusAppWindow() noexcept {
 
   ShowWindow(app_window_, SW_SHOW);
   SetForegroundWindow(app_window_);
-  SetFocus(app_window_);
+  // NOTE: deliberately NOT calling SetFocus(app_window_) here. SetFocus on the
+  // ROOT hwnd resets Flutter's IME / text-input child-window focus chain, so a
+  // TextField the user is typing into loses focus on every reclaim (the
+  // "typing gets eaten" bug). SetForegroundWindow + HWND_TOPMOST already pull
+  // us to the front; Flutter restores keyboard focus to its own child view.
   // Pin above other top-most windows without resizing/moving.
   SetWindowPos(app_window_, HWND_TOPMOST, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -255,6 +284,12 @@ void CALLBACK FlutterWindow::WinEventProc(HWINEVENTHOOK /*hook*/, DWORD event,
   if (event != EVENT_SYSTEM_FOREGROUND) {
     return;
   }
+  // Never react to our OWN windows. WINEVENT_SKIPOWNPROCESS does not reliably
+  // skip intra-process IME / child windows, and reclaiming on those would steal
+  // focus from a TextField the user is typing into (the typing-eaten bug).
+  if (hwnd == app_window_ || IsSameProcess(hwnd)) {
+    return;
+  }
   // Only act while locked, and only when the new foreground is not allowed.
   if (!IsLockActive()) {
     return;
@@ -262,6 +297,9 @@ void CALLBACK FlutterWindow::WinEventProc(HWINEVENTHOOK /*hook*/, DWORD event,
   if (ShouldAllowForeground(hwnd, app_window_)) {
     return;  // grant mode: let an allowed app stay foreground.
   }
+  // Block + MINIMIZE the distraction (never kill — don't lose the user's work),
+  // then reclaim foreground for our overlay.
+  MinimizeForeignWindow(hwnd, app_window_);
   RefocusAppWindow();
 }
 

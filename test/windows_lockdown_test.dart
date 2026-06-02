@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sleep_time/platform/windows_lock_state.dart';
+import 'package:sleep_time/platform/windows_lockdown.dart';
 
 void main() {
   group('WindowsLockState (de)serialization', () {
@@ -117,6 +118,33 @@ void main() {
     test('empty image or empty allow-list never matches', () {
       expect(WindowsAppResolver.isAllowed('', ['chrome.exe']), isFalse);
       expect(WindowsAppResolver.isAllowed('chrome.exe', const []), isFalse);
+    });
+  });
+
+  group('app-control critical-process safelist (#7 block+minimize, never kill)',
+      () {
+    test('refuses core OS / session processes', () {
+      expect(WindowsLockdown.isCriticalProcess('explorer'), isTrue);
+      expect(WindowsLockdown.isCriticalProcess('explorer.exe'), isTrue);
+      expect(WindowsLockdown.isCriticalProcess('winlogon.exe'), isTrue);
+      expect(WindowsLockdown.isCriticalProcess('lsass.exe'), isTrue);
+      expect(WindowsLockdown.isCriticalProcess('csrss.exe'), isTrue);
+    });
+
+    test('refuses our own enforcement processes', () {
+      expect(WindowsLockdown.isCriticalProcess('sleep_time.exe'), isTrue);
+      expect(
+          WindowsLockdown.isCriticalProcess('sleep_time_watchdog.exe'), isTrue);
+    });
+
+    test('allows ordinary distraction apps to be minimized', () {
+      expect(WindowsLockdown.isCriticalProcess('discord'), isFalse);
+      expect(WindowsLockdown.isCriticalProcess('chrome'), isFalse);
+      expect(WindowsLockdown.isCriticalProcess('Spotify.exe'), isFalse);
+    });
+
+    test('matching is case-insensitive on the resolved image name', () {
+      expect(WindowsLockdown.isCriticalProcess('EXPLORER.EXE'), isTrue);
     });
   });
 }

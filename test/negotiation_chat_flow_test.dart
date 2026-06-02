@@ -35,15 +35,17 @@ void main() {
   });
 
   Future<void> settleGreeting(WidgetTester tester) async {
-    // Pump frames until startSession() has loaded the asset and rendered the
-    // hardcoded (grantsUsedTonight==0) greeting, clearing the _isLoading guard.
-    final greeting = find.textContaining("what's so important");
-    for (var i = 0; i < 50 && greeting.evaluate().isEmpty; i++) {
+    // With no API key configured (tests run keyless in safe mode), the opening
+    // turn is NOT a hardcoded greeting anymore — startSession() renders the
+    // "guardian offline" system banner and clears _isLoading. Pump until it
+    // appears so the input is live before we type.
+    final banner = find.textContaining('guardian offline');
+    for (var i = 0; i < 50 && banner.evaluate().isEmpty; i++) {
       await Future<void>.delayed(const Duration(milliseconds: 20));
       await tester.pump();
     }
-    expect(greeting, findsOneWidget,
-        reason: 'greeting should render (startSession settled, not loading)');
+    expect(banner, findsOneWidget,
+        reason: 'offline banner should render (startSession settled, keyless)');
   }
 
   testWidgets('typing the debug bypass grants time and fires onGranted',
@@ -75,6 +77,42 @@ void main() {
       await tester.pump();
       expect(grantedMinutes, 1,
           reason: 'debug solara bypass grants exactly 1 minute');
+    });
+  });
+
+  testWidgets(
+      '#4 a grant does NOT freeze the input — chat stays live (unlimited)',
+      (tester) async {
+    await tester.runAsync(() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: NegotiationChat(
+              engine: NegotiationEngine(),
+              grantsUsedTonight: 0,
+              onGranted: (_) {},
+            ),
+          ),
+        ),
+      );
+      await settleGreeting(tester);
+
+      // solara debug bypass returns a GRANT decision.
+      await tester.enterText(find.byType(TextField), 'solara');
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+      await tester.pump();
+      expect(find.textContaining('one minute'), findsOneWidget);
+
+      // Let the deferred onGranted dispatch (~2s) run.
+      await Future<void>.delayed(const Duration(milliseconds: 2300));
+      await tester.pump();
+
+      // The input must remain ENABLED after a grant — the conversation is
+      // continuous; only the safe word / end_session freeze it.
+      final field = tester.widget<TextField>(find.byType(TextField));
+      expect(field.enabled, isTrue,
+          reason: 'grant must not set _negotiationOver / disable the input');
     });
   });
 
