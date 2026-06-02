@@ -210,6 +210,126 @@ class GuardianTools {
   ];
 }
 
+/// Extract the CURRENT (possibly partial) value of a top-level string field
+/// from a possibly-incomplete JSON object string. Used to surface the
+/// guardian's `message` live while the tool-input JSON is still streaming in
+/// over SSE.
+///
+/// Algorithm: find `"<field>"`, then the next `:`, then the opening `"`, then
+/// read characters until an UNescaped closing `"` (value complete) or the end
+/// of the buffer (value still arriving). Escapes are unescaped on the fly
+/// (`\n \t \r \" \\ \/ \b \f` and `\uXXXX` best-effort). A trailing lone
+/// backslash (an escape whose payload hasn't arrived yet) is dropped so we
+/// never emit a dangling `\`.
+///
+/// Returns null when the key, its colon, or the value-opening quote has not yet
+/// appeared in the buffer — i.e. there is nothing to show for [field] yet.
+String? extractPartialJsonStringField(String partialJson, String field) {
+  final keyToken = '"$field"';
+  // Search for the key. Restart the scan whenever the colon/quote that should
+  // follow turns out not to (defends against a same-named substring appearing
+  // earlier in another value — unlikely for our schema but cheap to guard).
+  var searchFrom = 0;
+  while (true) {
+    final keyIndex = partialJson.indexOf(keyToken, searchFrom);
+    if (keyIndex < 0) return null;
+
+    var i = keyIndex + keyToken.length;
+    // Skip whitespace to the colon.
+    while (i < partialJson.length && _isJsonWs(partialJson.codeUnitAt(i))) {
+      i++;
+    }
+    if (i >= partialJson.length) return null; // colon not here yet
+    if (partialJson.codeUnitAt(i) != _colon) {
+      // Not actually our key (no colon follows) — keep looking.
+      searchFrom = keyIndex + keyToken.length;
+      continue;
+    }
+    i++; // past ':'
+    // Skip whitespace to the opening quote.
+    while (i < partialJson.length && _isJsonWs(partialJson.codeUnitAt(i))) {
+      i++;
+    }
+    if (i >= partialJson.length) return null; // value-open not here yet
+    if (partialJson.codeUnitAt(i) != _quote) {
+      // Value is not a string (or the opening quote hasn't streamed). Nothing
+      // to surface for a string field yet.
+      searchFrom = keyIndex + keyToken.length;
+      continue;
+    }
+    i++; // past opening '"'
+
+    final sb = StringBuffer();
+    while (i < partialJson.length) {
+      final c = partialJson.codeUnitAt(i);
+      if (c == _backslash) {
+        // An escape sequence. If its payload hasn't streamed yet, stop and emit
+        // what we have (drop the lone trailing backslash).
+        if (i + 1 >= partialJson.length) break;
+        final next = partialJson.codeUnitAt(i + 1);
+        switch (next) {
+          case 0x6E: // n
+            sb.write('\n');
+            i += 2;
+          case 0x74: // t
+            sb.write('\t');
+            i += 2;
+          case 0x72: // r
+            sb.write('\r');
+            i += 2;
+          case 0x62: // b
+            sb.write('\b');
+            i += 2;
+          case 0x66: // f
+            sb.write('\f');
+            i += 2;
+          case _quote:
+            sb.write('"');
+            i += 2;
+          case _backslash:
+            sb.write('\\');
+            i += 2;
+          case 0x2F: // /
+            sb.write('/');
+            i += 2;
+          case 0x75: // u — \uXXXX
+            // Need 4 more hex digits. If they haven't all streamed, stop.
+            if (i + 6 > partialJson.length) {
+              i = partialJson.length; // force loop exit, drop partial escape
+              break;
+            }
+            final hex = partialJson.substring(i + 2, i + 6);
+            final code = int.tryParse(hex, radix: 16);
+            if (code != null) {
+              sb.writeCharCode(code);
+            }
+            i += 6;
+          default:
+            // Unknown escape — emit the escaped char literally.
+            sb.writeCharCode(next);
+            i += 2;
+        }
+        continue;
+      }
+      if (c == _quote) {
+        // Unescaped closing quote — the value is complete.
+        return sb.toString();
+      }
+      sb.writeCharCode(c);
+      i++;
+    }
+    // Reached end of buffer without a closing quote: value still arriving.
+    return sb.toString();
+  }
+}
+
+const int _quote = 0x22; // "
+const int _backslash = 0x5C; // \
+const int _colon = 0x3A; // :
+
+bool _isJsonWs(int c) =>
+    c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D; // space tab nl cr
+
 /// Safe fallback used whenever a tool call is malformed, unknown, or missing
 /// its required user-facing `message`. The guardian can never produce a blank
 /// bubble or silently fall through to [GuardianAction.none].

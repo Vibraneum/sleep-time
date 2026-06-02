@@ -14,7 +14,10 @@ class _StuckEngine extends NegotiationEngine {
   bool negotiateCalled = false;
 
   @override
-  Future<GuardianDecision> negotiate(String userMessage) {
+  Future<GuardianDecision> negotiate(
+    String userMessage, {
+    void Function(String partialMessage)? onDelta,
+  }) {
     negotiateCalled = true;
     return gate.future;
   }

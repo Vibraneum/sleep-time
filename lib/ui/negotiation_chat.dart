@@ -52,22 +52,29 @@ class NegotiationChat extends StatefulWidget {
 }
 
 class _ChatMessage {
-  final String text;
+  /// Mutable so a guardian bubble can grow token-by-token while streaming and
+  /// be finalized in place.
+  String text;
   final bool isUser;
 
   /// When set on a guardian message, a small info chip is shown beneath the
   /// bubble describing the real outcome of an adjust_schedule call.
-  final String? scheduleNote;
+  String? scheduleNote;
 
   /// System messages render as a centered banner (e.g. "guardian offline —
   /// configure API key") with an inline action, not a guardian chat bubble.
   final bool isSystem;
 
+  /// True while the guardian's reply is still arriving over the stream. Drives
+  /// the thinking indicator (before the first token) and the blinking cursor
+  /// (once text is flowing). Cleared when the bubble is finalized.
+  bool streaming;
+
   _ChatMessage({
     required this.text,
     required this.isUser,
-    this.scheduleNote,
     this.isSystem = false,
+    this.streaming = false,
   });
 }
 
@@ -83,6 +90,15 @@ class _NegotiationChatState extends State<NegotiationChat> {
 
   final List<_ChatMessage> _messages = [];
   bool _isLoading = false;
+
+  /// The guardian bubble currently being streamed into, or null when no stream
+  /// is in flight. Deltas mutate this bubble's text in place.
+  _ChatMessage? _streamingBubble;
+
+  /// Monotonic id for the in-flight stream. The safe word (which can fire
+  /// mid-stream) bumps this so any still-arriving deltas / the finalize step
+  /// for the previous turn become no-ops and never clobber the safe-word UI.
+  int _streamGeneration = 0;
 
   /// A TRUE end of the conversation: only the safe word and a guardian
   /// end_session/close freeze the input. A grant / minimize / app-unlock keeps
@@ -126,18 +142,41 @@ class _NegotiationChatState extends State<NegotiationChat> {
         DateTime.now().difference(lastProactive) < _silencePingThrottle) {
       return;
     }
-    setState(() => _isLoading = true);
+    final generation = ++_streamGeneration;
+    final bubble = _ChatMessage(text: '', isUser: false, streaming: true);
+    setState(() {
+      _streamingBubble = bubble;
+      _messages.add(bubble);
+      _isLoading = true;
+    });
+    _scrollToBottom();
     try {
-      final decision =
-          await widget.engine.negotiateProactive(ProactiveTrigger.silence);
-      if (!mounted) return;
+      final decision = await widget.engine.negotiateProactive(
+        ProactiveTrigger.silence,
+        onDelta: (partial) {
+          if (!mounted || generation != _streamGeneration) return;
+          setState(() => bubble.text = partial);
+          _scrollToBottom();
+        },
+      );
+      if (!mounted || generation != _streamGeneration) return;
       setState(() {
-        _messages.add(_ChatMessage(text: decision.message, isUser: false));
+        bubble
+          ..text = decision.message
+          ..streaming = false;
+        _streamingBubble = null;
         _isLoading = false;
       });
       _scrollToBottom();
     } catch (_) {
-      if (mounted) setState(() => _isLoading = false);
+      if (mounted && generation == _streamGeneration) {
+        setState(() {
+          // Drop the empty streaming bubble on a failed silence ping.
+          _messages.remove(bubble);
+          _streamingBubble = null;
+          _isLoading = false;
+        });
+      }
     }
   }
 
@@ -157,12 +196,37 @@ class _NegotiationChatState extends State<NegotiationChat> {
         return;
       }
       // The opening line is REAL model output (a proactive guardian turn)
-      // through the same tool loop — not a hardcoded string. Falls back to a
-      // canned line only if the proactive call fails.
-      final decision =
-          await widget.engine.negotiateProactive(ProactiveTrigger.open);
-      _messages.add(_ChatMessage(text: decision.message, isUser: false));
+      // through the same tool loop — not a hardcoded string, and now STREAMED
+      // token-by-token. Falls back to a canned line only if the call fails.
+      final generation = ++_streamGeneration;
+      final bubble = _ChatMessage(text: '', isUser: false, streaming: true);
+      setState(() {
+        _streamingBubble = bubble;
+        _messages.add(bubble);
+      });
+      _scrollToBottom();
+      final decision = await widget.engine.negotiateProactive(
+        ProactiveTrigger.open,
+        onDelta: (partial) {
+          if (!mounted || generation != _streamGeneration) return;
+          setState(() => bubble.text = partial);
+          _scrollToBottom();
+        },
+      );
+      if (mounted && generation == _streamGeneration) {
+        setState(() {
+          bubble
+            ..text = decision.message
+            ..streaming = false;
+          _streamingBubble = null;
+        });
+      }
     } catch (_) {
+      // Drop any half-built streaming bubble before showing the fallback.
+      if (_streamingBubble != null) {
+        _messages.remove(_streamingBubble);
+        _streamingBubble = null;
+      }
       _messages.add(_ChatMessage(text: _fallbackGreeting(), isUser: false));
     }
     if (mounted) {
@@ -194,7 +258,11 @@ class _NegotiationChatState extends State<NegotiationChat> {
     if (AppConfig.safeWord.isNotEmpty &&
         text.toLowerCase() == AppConfig.safeWord.toLowerCase()) {
       _controller.clear();
+      // Cancel any in-flight stream: bump the generation so its deltas/finalize
+      // become no-ops, and detach the streaming bubble so the safe-word UI wins.
+      _streamGeneration++;
       setState(() {
+        _streamingBubble = null;
         _messages.add(_ChatMessage(text: text, isUser: true));
         _messages.add(_ChatMessage(
           text: 'safe word accepted. shutting down.',
@@ -212,20 +280,37 @@ class _NegotiationChatState extends State<NegotiationChat> {
     if (_isLoading || _negotiationOver) return;
 
     _controller.clear();
+    // Open a fresh stream generation and a guardian bubble in the "streaming"
+    // state. Until the first delta arrives the bubble shows a thinking
+    // indicator; deltas grow its text live; completion finalizes it below.
+    final generation = ++_streamGeneration;
+    final bubble = _ChatMessage(text: '', isUser: false, streaming: true);
     setState(() {
       _messages.add(_ChatMessage(text: text, isUser: true));
+      _streamingBubble = bubble;
+      _messages.add(bubble);
       _isLoading = true;
     });
     _scrollToBottom();
 
     try {
-      final decision = await widget.engine.negotiate(text);
+      final decision = await widget.engine.negotiate(
+        text,
+        onDelta: (partial) {
+          // Ignore deltas from a superseded stream (e.g. safe word fired).
+          if (!mounted || generation != _streamGeneration) return;
+          setState(() => bubble.text = partial);
+          _scrollToBottom();
+        },
+      );
+      // A superseded stream (safe word mid-flight) must not clobber the UI.
+      if (!mounted || generation != _streamGeneration) return;
       setState(() {
-        _messages.add(_ChatMessage(
-          text: decision.message,
-          isUser: false,
-          scheduleNote: decision.scheduleOutcomeNote,
-        ));
+        bubble
+          ..text = decision.message
+          ..scheduleNote = decision.scheduleOutcomeNote
+          ..streaming = false;
+        _streamingBubble = null;
         _isLoading = false;
       });
       _trackOfflineStreak(decision);
@@ -278,11 +363,16 @@ class _NegotiationChatState extends State<NegotiationChat> {
         }
       }
     } catch (e) {
-      setState(() {
-        _messages.add(
-            _ChatMessage(text: "something broke. try again.", isUser: false));
-        _isLoading = false;
-      });
+      // Don't clobber the UI if this stream was superseded (safe word).
+      if (mounted && generation == _streamGeneration) {
+        setState(() {
+          bubble
+            ..text = 'something broke. try again.'
+            ..streaming = false;
+          _streamingBubble = null;
+          _isLoading = false;
+        });
+      }
     }
 
     _scrollToBottom();
@@ -346,7 +436,12 @@ class _NegotiationChatState extends State<NegotiationChat> {
           child: ListView.builder(
             controller: _scrollController,
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-            itemCount: _messages.length + (_isLoading ? 1 : 0),
+            // The trailing typing indicator only shows when we're loading but
+            // have NOT yet inserted a streaming bubble (e.g. the brief gap
+            // before a stream opens). Once a streaming bubble exists it carries
+            // its own thinking indicator / live text, so we don't double up.
+            itemCount: _messages.length +
+                ((_isLoading && _streamingBubble == null) ? 1 : 0),
             itemBuilder: (context, index) {
               if (index == _messages.length) return _buildTypingIndicator();
               return _buildMessage(_messages[index]);
@@ -538,14 +633,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
                         : Colors.white.withAlpha(10),
                     borderRadius: BorderRadius.circular(16),
                   ),
-                  child: Text(
-                    msg.text,
-                    style: TextStyle(
-                      color: Colors.white.withAlpha(220),
-                      fontSize: 15,
-                      height: 1.4,
-                    ),
-                  ),
+                  child: _bubbleContent(msg),
                 ),
                 if (msg.scheduleNote != null) ...[
                   const SizedBox(height: 6),
@@ -558,6 +646,37 @@ class _NegotiationChatState extends State<NegotiationChat> {
         ],
       ),
     );
+  }
+
+  /// The inner content of a guardian/user bubble. While a guardian bubble is
+  /// streaming with no text yet, show an animated thinking indicator; once
+  /// tokens arrive, show the live text with a subtle blinking cursor until the
+  /// stream completes. Finalized / user bubbles are plain text.
+  Widget _bubbleContent(_ChatMessage msg) {
+    final textStyle = TextStyle(
+      color: Colors.white.withAlpha(220),
+      fontSize: 15,
+      height: 1.4,
+    );
+    if (msg.streaming && msg.text.isEmpty) {
+      return const _ThinkingDots();
+    }
+    if (msg.streaming) {
+      // Live text with a trailing blinking cursor.
+      return RichText(
+        text: TextSpan(
+          style: textStyle,
+          children: [
+            TextSpan(text: msg.text),
+            const WidgetSpan(
+              alignment: PlaceholderAlignment.middle,
+              child: _BlinkingCursor(),
+            ),
+          ],
+        ),
+      );
+    }
+    return Text(msg.text, style: textStyle);
   }
 
   Widget _scheduleNoteChip(String note) {
@@ -617,16 +736,106 @@ class _NegotiationChatState extends State<NegotiationChat> {
               color: Colors.white.withAlpha(10),
               borderRadius: BorderRadius.circular(16),
             ),
-            child: Text(
-              '...',
-              style: TextStyle(
-                color: Colors.white.withAlpha(100),
-                fontSize: 15,
-              ),
-            ),
+            child: const _ThinkingDots(),
           ),
         ],
       ),
+    );
+  }
+}
+
+/// Animated three-dot "thinking" indicator shown before the first streamed
+/// token arrives. Each dot fades in/out on a staggered cycle.
+class _ThinkingDots extends StatefulWidget {
+  const _ThinkingDots();
+
+  @override
+  State<_ThinkingDots> createState() => _ThinkingDotsState();
+}
+
+class _ThinkingDotsState extends State<_ThinkingDots>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: List.generate(3, (i) {
+            // Stagger each dot's phase across the cycle.
+            final phase = (_controller.value - i * 0.2) % 1.0;
+            final t = phase < 0 ? phase + 1.0 : phase;
+            // Triangle wave 0->1->0 for a smooth fade pulse.
+            final pulse = t < 0.5 ? t * 2 : (1 - t) * 2;
+            final alpha = (80 + pulse * 140).round().clamp(0, 255);
+            return Padding(
+              padding: EdgeInsets.only(right: i < 2 ? 4 : 0),
+              child: Container(
+                width: 7,
+                height: 7,
+                decoration: BoxDecoration(
+                  color: Colors.white.withAlpha(alpha),
+                  shape: BoxShape.circle,
+                ),
+              ),
+            );
+          }),
+        );
+      },
+    );
+  }
+}
+
+/// A subtle blinking cursor appended to the live streaming text until the
+/// guardian's reply completes.
+class _BlinkingCursor extends StatefulWidget {
+  const _BlinkingCursor();
+
+  @override
+  State<_BlinkingCursor> createState() => _BlinkingCursorState();
+}
+
+class _BlinkingCursorState extends State<_BlinkingCursor>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 900),
+  )..repeat();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _controller,
+      builder: (context, _) {
+        final visible = _controller.value < 0.5;
+        return Opacity(
+          opacity: visible ? 1.0 : 0.0,
+          child: Container(
+            width: 2,
+            height: 16,
+            margin: const EdgeInsets.only(left: 2),
+            color: const Color(0xFF8E8EFF),
+          ),
+        );
+      },
     );
   }
 }

@@ -5,6 +5,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'package:google_generative_ai/google_generative_ai.dart';
 import 'package:http/http.dart' as http;
 
+import 'anthropic_stream.dart';
 import 'config.dart';
 import 'guardian_tools.dart';
 import 'memory_service.dart';
@@ -344,7 +345,15 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     }
   }
 
-  Future<GuardianDecision> negotiate(String userMessage) async {
+  /// [onDelta], when provided, routes the Anthropic branch through real-time
+  /// streaming: it is called with the current (growing) guardian `message`
+  /// snapshot as the tool-input JSON arrives token-by-token. Gemini and the
+  /// no-key / debug paths ignore it (non-streaming) — they simply never call
+  /// it, so the UI shows a thinking indicator then the final bubble.
+  Future<GuardianDecision> negotiate(
+    String userMessage, {
+    void Function(String partialMessage)? onDelta,
+  }) async {
     if (kDebugMode && userMessage.trim().toLowerCase() == 'solara') {
       return GuardianDecision(
         message: 'fine. one minute. test it and leave.',
@@ -369,7 +378,7 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       sessionId: _sessionId,
     ));
 
-    final decision = await _sendToProvider(userMessage);
+    final decision = await _sendToProvider(userMessage, onDelta: onDelta);
 
     await MemoryService.saveMessage(ConversationMessage(
       role: 'guardian',
@@ -418,7 +427,10 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
   /// line / silence ping / grant-expiry warning / wind-down nudge is REAL model
   /// output rendered as a guardian bubble — not a hardcoded string. Falls back
   /// to a safe canned line only when offline / no key. Throttled by the caller.
-  Future<GuardianDecision> negotiateProactive(ProactiveTrigger trigger) async {
+  Future<GuardianDecision> negotiateProactive(
+    ProactiveTrigger trigger, {
+    void Function(String partialMessage)? onDelta,
+  }) async {
     if (_sessionId.isEmpty) {
       await startSession();
     }
@@ -434,8 +446,12 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       return GuardianDecision(message: _proactiveFallback(trigger));
     }
 
-    final decision =
-        await _sendAnthropicToolUse(_proactivePrompt(trigger));
+    final decision = onDelta != null
+        ? await _sendAnthropicToolUseStreaming(
+            _proactivePrompt(trigger),
+            onDelta: onDelta,
+          )
+        : await _sendAnthropicToolUse(_proactivePrompt(trigger));
 
     await MemoryService.saveMessage(ConversationMessage(
       role: 'guardian',
@@ -470,7 +486,10 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
     await startSession(force: true);
   }
 
-  Future<GuardianDecision> _sendToProvider(String userMessage) async {
+  Future<GuardianDecision> _sendToProvider(
+    String userMessage, {
+    void Function(String partialMessage)? onDelta,
+  }) async {
     switch (AppConfig.aiProvider) {
       case AiProvider.gemini:
         if (_geminiChat == null) await startSession();
@@ -492,7 +511,9 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
           );
         }
       case AiProvider.anthropic:
-        return _sendAnthropicToolUse(userMessage);
+        return onDelta != null
+            ? _sendAnthropicToolUseStreaming(userMessage, onDelta: onDelta)
+            : _sendAnthropicToolUse(userMessage);
     }
   }
 
@@ -502,23 +523,18 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         'anthropic-version': '2023-06-01',
       };
 
-  Future<GuardianDecision> _sendAnthropicToolUse(String userMessage) async {
-    // History-shape invariant: if a tool_use is pending from the previous
-    // assistant turn, the tool_result block comes FIRST in this user turn.
-    // Build the next user turn LOCALLY and do NOT mutate _anthropicHistory or
-    // clear _lastToolUseId / _pendingToolResultAck until the request has
-    // succeeded and parsed — otherwise a timeout / non-2xx / bad-JSON leaves the
-    // local session out of sync with the provider (a phantom user turn the API
-    // never saw, and a discarded pending tool_result).
-    // Inject a small LIVE memory delta per turn (grant count, denials tonight,
-    // time since session start) rather than re-baking the cached system prompt
-    // — the cached system prompt stays byte-stable so the prompt cache keeps
-    // hitting, while the model still sees fresh state every turn.
+  /// Build the next Anthropic user turn LOCALLY (without mutating
+  /// _anthropicHistory). History-shape invariant: if a tool_use is pending from
+  /// the previous assistant turn, the tool_result block comes FIRST in this
+  /// user turn. Injects a small LIVE memory delta per turn (grant count,
+  /// denials tonight, time since session start) rather than re-baking the
+  /// cached system prompt — the cached system prompt stays byte-stable so the
+  /// prompt cache keeps hitting, while the model still sees fresh state.
+  Future<Map<String, dynamic>> _buildNextUserTurn(String userMessage) async {
     final memoryDelta = await _buildMemoryDelta();
     final turnText =
         memoryDelta.isEmpty ? userMessage : '$memoryDelta\n\n$userMessage';
-
-    final nextUserTurn = <String, dynamic>{
+    return <String, dynamic>{
       'role': 'user',
       'content': buildUserTurnContent(
         userMessage: turnText,
@@ -526,6 +542,52 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
         toolResultAck: _pendingToolResultAck,
       ),
     };
+  }
+
+  /// Commit a successful turn to history and map it to a final decision. Shared
+  /// by the streaming and non-streaming paths so the tool_result-FIRST ordering
+  /// and tool_use_id tracking stay byte-identical between them. [content] is the
+  /// assistant content block list to persist; [toolName]/[toolInput]/[toolId]
+  /// are the parsed tool_use fields.
+  ///
+  /// Do NOT mutate _anthropicHistory / _lastToolUseId / _pendingToolResultAck
+  /// until the request has succeeded and parsed — otherwise a timeout / non-2xx
+  /// / bad-JSON leaves the local session out of sync with the provider.
+  Future<GuardianDecision> _commitAnthropicTurn({
+    required Map<String, dynamic> nextUserTurn,
+    required List<dynamic> content,
+    required String toolName,
+    required Map<String, dynamic> toolInput,
+    required String? toolId,
+  }) async {
+    // Success: NOW commit the user turn + assistant content (incl. the tool_use
+    // block) to history and track the tool_use_id for the next turn's
+    // tool_result. _pendingToolResultAck resets to the generic ack here; only
+    // adjust_schedule re-sets it below.
+    _anthropicHistory.add(nextUserTurn);
+    _anthropicHistory.add({'role': 'assistant', 'content': content});
+    _lastToolUseId = toolId;
+    _pendingToolResultAck = 'noted.';
+
+    final decision = guardianDecisionFromToolUse(toolName, toolInput);
+
+    if (decision.action == GuardianAction.adjustSchedule) {
+      return _applyScheduleAdjustment(decision);
+    }
+    if (decision.action == GuardianAction.saveMemory) {
+      await _persistGuardianMemory(decision);
+      // save_memory is a side effect, not a UI action — present it like a deny
+      // (keep-talking) so the chat stays live and the guardian's message shows.
+      return GuardianDecision(
+        message: decision.message,
+        action: GuardianAction.deny,
+      );
+    }
+    return decision;
+  }
+
+  Future<GuardianDecision> _sendAnthropicToolUse(String userMessage) async {
+    final nextUserTurn = await _buildNextUserTurn(userMessage);
 
     final body = buildAnthropicToolRequest(
       systemPrompt: _systemPrompt ?? '',
@@ -584,33 +646,122 @@ Never stop mid-sentence. Keep answers short, but complete the sentence cleanly.'
       );
     }
 
-    // Success: NOW commit the user turn + assistant content (incl. the tool_use
-    // block) to history and track the tool_use_id for the next turn's
-    // tool_result. _pendingToolResultAck resets to the generic ack here; only
-    // adjust_schedule re-sets it below.
-    _anthropicHistory.add(nextUserTurn);
-    _anthropicHistory.add({'role': 'assistant', 'content': content});
-    _lastToolUseId = toolUse['id'] as String?;
-    _pendingToolResultAck = 'noted.';
-
     final toolName = toolUse['name'] as String? ?? '';
     final input = (toolUse['input'] as Map?)?.cast<String, dynamic>() ??
         <String, dynamic>{};
-    final decision = guardianDecisionFromToolUse(toolName, input);
+    return _commitAnthropicTurn(
+      nextUserTurn: nextUserTurn,
+      content: content,
+      toolName: toolName,
+      toolInput: input,
+      toolId: toolUse['id'] as String?,
+    );
+  }
 
-    if (decision.action == GuardianAction.adjustSchedule) {
-      return _applyScheduleAdjustment(decision);
-    }
-    if (decision.action == GuardianAction.saveMemory) {
-      await _persistGuardianMemory(decision);
-      // save_memory is a side effect, not a UI action — present it like a deny
-      // (keep-talking) so the chat stays live and the guardian's message shows.
-      return GuardianDecision(
-        message: decision.message,
-        action: GuardianAction.deny,
+  /// Real-time STREAMING variant of [_sendAnthropicToolUse]. Builds the SAME
+  /// request body (prompt-caching breakpoints, tool_choice:any,
+  /// disable_parallel_tool_use, tool_result-first history) plus
+  /// `'stream': true`, reads the SSE event stream, and surfaces the guardian's
+  /// `message` field live via [onDelta] as the tool-input JSON arrives.
+  ///
+  /// Robust fallback: ANY stream error (network, non-2xx, malformed SSE, no
+  /// tool_use, undecodable final JSON) falls back to the non-streaming
+  /// [_sendAnthropicToolUse] path so the chat never hard-breaks. History is
+  /// only committed once on success — the fallback path builds its own turn, so
+  /// the tool_result-first ordering is never doubled.
+  Future<GuardianDecision> _sendAnthropicToolUseStreaming(
+    String userMessage, {
+    required void Function(String partialMessage) onDelta,
+  }) async {
+    final nextUserTurn = await _buildNextUserTurn(userMessage);
+
+    final body = buildAnthropicToolRequest(
+      systemPrompt: _systemPrompt ?? '',
+      messages: [..._anthropicHistory, nextUserTurn],
+    )..['stream'] = true;
+
+    final client = http.Client();
+    try {
+      final request = http.Request(
+        'POST',
+        Uri.parse('https://api.anthropic.com/v1/messages'),
+      )
+        ..headers.addAll(_anthropicHeaders())
+        ..body = jsonEncode(body);
+
+      final streamed =
+          await client.send(request).timeout(const Duration(seconds: 30));
+
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+        // Drain so the socket can close, then fall back to non-streaming.
+        await streamed.stream.drain<void>().catchError((_) {});
+        return _sendAnthropicToolUse(userMessage);
+      }
+
+      final parser = SseParser();
+      final acc = AnthropicStreamAccumulator(
+        extractMessage: extractPartialJsonStringField,
       );
+
+      void process(SseEvent event) {
+        Map<String, dynamic> data;
+        try {
+          final decoded = jsonDecode(event.data);
+          if (decoded is! Map) return;
+          data = decoded.cast<String, dynamic>();
+        } catch (_) {
+          return; // tolerate a malformed single event
+        }
+        final snapshot = acc.handleEvent(event.type, data);
+        if (snapshot != null) onDelta(snapshot);
+      }
+
+      await for (final chunk
+          in streamed.stream.transform(utf8.decoder).timeout(
+                const Duration(seconds: 30),
+              )) {
+        for (final event in parser.add(chunk)) {
+          process(event);
+        }
+      }
+      final tail = parser.flush();
+      if (tail != null) process(tail);
+
+      // Assemble the final tool-input JSON and map it. If anything is missing
+      // (no tool block, undecodable JSON), fall back to non-streaming.
+      final toolName = acc.toolName;
+      final toolInputJson = acc.toolInputJson;
+      if (toolName == null || toolInputJson.trim().isEmpty) {
+        return _sendAnthropicToolUse(userMessage);
+      }
+      final Map<String, dynamic> input = acc.decodeToolInput();
+      if (input.isEmpty) {
+        return _sendAnthropicToolUse(userMessage);
+      }
+
+      // Reconstruct the assistant content block to persist EXACTLY as the
+      // non-streaming path would have received it.
+      final toolUseBlock = <String, dynamic>{
+        'type': 'tool_use',
+        'id': acc.toolUseId,
+        'name': toolName,
+        'input': input,
+      };
+
+      return _commitAnthropicTurn(
+        nextUserTurn: nextUserTurn,
+        content: [toolUseBlock],
+        toolName: toolName,
+        toolInput: input,
+        toolId: acc.toolUseId,
+      );
+    } catch (_) {
+      // Network drop / timeout / unexpected error mid-stream: fall back to the
+      // non-streaming path (which builds its own fresh turn). Never hard-break.
+      return _sendAnthropicToolUse(userMessage);
+    } finally {
+      client.close();
     }
-    return decision;
   }
 
   /// Persist a guardian-authored memory. Best-effort; failures are swallowed to

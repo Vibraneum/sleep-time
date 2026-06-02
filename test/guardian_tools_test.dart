@@ -2,6 +2,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sleep_time/core/config.dart';
 import 'package:sleep_time/core/guardian_tools.dart';
 import 'package:sleep_time/core/negotiation_engine.dart';
+import 'package:sleep_time/core/schedule_guardrails.dart' show ScheduleScope;
 
 void main() {
   group('guardianDecisionFromToolUse', () {
@@ -227,6 +228,200 @@ void main() {
 
       expect(d.action, GuardianAction.deny);
       expect(d.message, 'no.');
+    });
+  });
+
+  group('six-tool round-trip coverage', () {
+    // Every tool the guardian can call must map to the right GuardianAction and
+    // carry its payload fields. This is the canonical coverage check.
+    test('guardian_action -> grant', () {
+      final d = guardianDecisionFromToolUse('guardian_action', {
+        'action': 'grant',
+        'minutes': 10,
+        'message': 'ten minutes. go.',
+      });
+      expect(d.action, GuardianAction.grant);
+      expect(d.minutesGranted, 10);
+    });
+
+    test('unlock_app -> unlockApp', () {
+      final d = guardianDecisionFromToolUse('unlock_app', {
+        'app_identifier': 'com.example.notes',
+        'minutes': 15,
+        'message': 'notes only.',
+      });
+      expect(d.action, GuardianAction.unlockApp);
+      expect(d.appIdentifier, 'com.example.notes');
+      expect(d.appMinutes, 15);
+    });
+
+    test('adjust_schedule -> adjustSchedule', () {
+      final d = guardianDecisionFromToolUse('adjust_schedule', {
+        'field': 'lockdown',
+        'hour': 23,
+        'minute': 45,
+        'scope': 'permanent',
+        'reason': 'new work schedule',
+        'message': 'moved.',
+      });
+      expect(d.action, GuardianAction.adjustSchedule);
+      expect(d.scheduleField, 'lockdown');
+      expect(d.scheduleHour, 23);
+      expect(d.scheduleMinute, 45);
+      expect(d.scheduleScope, ScheduleScope.permanent);
+      expect(d.scheduleReason, 'new work schedule');
+    });
+
+    test('control_app -> controlApp', () {
+      final d = guardianDecisionFromToolUse('control_app', {
+        'app_identifier': 'discord',
+        'action': 'minimize',
+        'message': 'away.',
+      });
+      expect(d.action, GuardianAction.controlApp);
+      expect(d.controlAppIdentifier, 'discord');
+      expect(d.controlAppAction, 'minimize');
+    });
+
+    test('save_memory -> saveMemory', () {
+      final d = guardianDecisionFromToolUse('save_memory', {
+        'memory_type': 'goal',
+        'text': 'finishing a thesis',
+        'message': 'got it.',
+      });
+      expect(d.action, GuardianAction.saveMemory);
+      expect(d.memoryType, 'goal');
+      expect(d.memoryText, 'finishing a thesis');
+    });
+
+    test('end_session -> unlock', () {
+      final d = guardianDecisionFromToolUse('end_session', {
+        'message': 'go.',
+      });
+      expect(d.action, GuardianAction.unlock);
+    });
+  });
+
+  group('extractPartialJsonStringField', () {
+    test('complete value', () {
+      expect(
+        extractPartialJsonStringField('{"message":"hello there"}', 'message'),
+        'hello there',
+      );
+    });
+
+    test('value still arriving (no closing quote yet)', () {
+      expect(
+        extractPartialJsonStringField('{"message":"hello the', 'message'),
+        'hello the',
+      );
+    });
+
+    test('partial mid-stream right after opening quote', () {
+      expect(
+        extractPartialJsonStringField('{"message":"', 'message'),
+        '',
+      );
+    });
+
+    test('key present but colon/value not yet -> null', () {
+      expect(
+        extractPartialJsonStringField('{"message"', 'message'),
+        isNull,
+      );
+      expect(
+        extractPartialJsonStringField('{"message":', 'message'),
+        isNull,
+      );
+    });
+
+    test('key not present yet -> null', () {
+      expect(
+        extractPartialJsonStringField('{"action":"deny"', 'message'),
+        isNull,
+      );
+      expect(
+        extractPartialJsonStringField('{', 'message'),
+        isNull,
+      );
+      expect(
+        extractPartialJsonStringField('', 'message'),
+        isNull,
+      );
+    });
+
+    test('escaped quote inside the value does not terminate early', () {
+      expect(
+        extractPartialJsonStringField(
+            r'{"message":"she said \"no\" firmly"}', 'message'),
+        'she said "no" firmly',
+      );
+    });
+
+    test('escaped quote mid-stream (still open)', () {
+      expect(
+        extractPartialJsonStringField(
+            r'{"message":"she said \"no', 'message'),
+        'she said "no',
+      );
+    });
+
+    test('newline / tab / backslash escapes are unescaped', () {
+      expect(
+        extractPartialJsonStringField(
+            r'{"message":"line1\nline2\ttab\\end"}', 'message'),
+        'line1\nline2\ttab\\end',
+      );
+    });
+
+    test('message key after other keys', () {
+      expect(
+        extractPartialJsonStringField(
+          '{"action":"grant","minutes":10,"message":"fine. ten."}',
+          'message',
+        ),
+        'fine. ten.',
+      );
+    });
+
+    test('message key after other keys, still arriving', () {
+      expect(
+        extractPartialJsonStringField(
+          '{"action":"grant","minutes":10,"message":"fine. te',
+          'message',
+        ),
+        'fine. te',
+      );
+    });
+
+    test('trailing lone backslash (escape payload not yet streamed) is dropped',
+        () {
+      expect(
+        extractPartialJsonStringField(r'{"message":"almost\', 'message'),
+        'almost',
+      );
+    });
+
+    test('partial \\u escape not yet complete is dropped', () {
+      expect(
+        extractPartialJsonStringField(r'{"message":"snow \u26', 'message'),
+        'snow ',
+      );
+    });
+
+    test('complete \\u escape is decoded', () {
+      expect(
+        extractPartialJsonStringField(r'{"message":"ABC"}', 'message'),
+        'ABC',
+      );
+    });
+
+    test('extracts a different field by name', () {
+      expect(
+        extractPartialJsonStringField(
+            '{"reason":"deadline","message":"ok"}', 'reason'),
+        'deadline',
+      );
     });
   });
 
