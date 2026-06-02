@@ -1,40 +1,64 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <!-- Android 14+ requires a typed foreground service permission. -->
+    <!-- Android 14+ requires a typed foreground service permission. The
+         bedtime guardian uses the "specialUse" type; see the <service>
+         declaration below for the mandatory subtype justification. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Left in place for the M5 overlay/AccessibilityService work. No
+         usage-access or overlay logic ships in M4. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Keep the screen on during lockdown so the device cannot drift to sleep
-         while the lockdown UI is active. -->
+    <!-- Keep the device awake long enough to post the schedule notifications
+         when an alarm fires while the device is idle. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <!-- Android 13+ runtime notification permission, used for wind-down /
-         lockdown / extension reminders. -->
+    <!-- Android 13+ runtime notification permission, used for the persistent
+         guardian notification + wind-down / lockdown / unlock reminders. -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Allow a high-priority full-screen alert when lockdown engages. -->
-    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
-    <!-- Required for the schedule to fire at exactly the configured wake /
-         wind-down / lockdown / unlock times on Android 12+. The app does not
-         use exact alarms today, but declaring intent here keeps the manifest
-         honest with where the scheduler is heading. -->
+    <!-- Required for the schedule to fire at exactly the configured wind-down /
+         lockdown / unlock times on Android 12+. We guard every exact-alarm call
+         with canScheduleExactAlarms() and degrade gracefully (inexact window)
+         when the user has not granted it, so we deliberately do NOT request the
+         auto-granted USE_EXACT_ALARM (a Play-restricted permission). -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+    <!-- Lets the user exempt the guardian from Doze battery optimisation so the
+         bedtime alarms survive overnight. Requested at runtime via the system
+         dialog; never auto-applied. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:label="sleep time"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
 
-        <!-- Device Admin Receiver for screen lock -->
+        <!-- Background bedtime guardian. specialUse FGS: it enforces a
+             user-configured lock schedule while the app is backgrounded. The
+             nested PROPERTY_SPECIAL_USE_FGS_SUBTYPE string is mandatory on
+             Android 14+ and is what Play review reads. -->
+        <service
+            android:name=".SleepGuardianService"
+            android:exported="false"
+            android:stopWithTask="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Enforces a user-configured bedtime lock schedule while the app is backgrounded." />
+        </service>
+
+        <!-- Fires the WIND_DOWN / LOCK / UNLOCK alarms. In-process only. -->
         <receiver
-            android:name=".SleepDeviceAdminReceiver"
-            android:exported="true"
-            android:permission="android.permission.BIND_DEVICE_ADMIN">
-            <meta-data
-                android:name="android.app.device_admin"
-                android:resource="@xml/device_admin" />
+            android:name=".AlarmReceiver"
+            android:exported="false" />
+
+        <!-- Re-arms alarms after a reboot. Android 15 forbids starting a
+             specialUse FGS directly from BOOT_COMPLETED, so this receiver only
+             enqueues an expedited WorkManager job (GuardianBootWorker). -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
             <intent-filter>
-                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
 
@@ -46,8 +70,7 @@
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
-            android:windowSoftInputMode="adjustResize"
-            android:lockTaskMode="if_whitelisted">
+            android:windowSoftInputMode="adjustResize">
             <!-- Specifies an Android theme to apply to this Activity as soon as
                  the Android process has started. This theme is visible to the user
                  while the Flutter UI initializes. After that, this theme continues

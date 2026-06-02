@@ -7,6 +7,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart' show databaseFactory, datab
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
 import 'core/schedule_store.dart';
+import 'platform/android_lockdown.dart';
 import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
@@ -119,7 +120,31 @@ Future<void> main() async {
 
   await ScheduleStore.instance.loadFromPrefs();
   await _loadConfig();
+  await _initAndroidGuardian();
   runApp(const SleepTimeApp());
+}
+
+/// On Android, hand the bedtime schedule to the native background guardian and
+/// start it once setup is complete and we are not in safe/simulate mode. The
+/// native service is the background backstop (alarms + persistent notification);
+/// the in-app Dart scheduler still drives the foreground UI. We also re-push the
+/// schedule to native whenever the in-app schedule changes.
+///
+/// Everything here is guarded so it is a no-op off-Android, before setup, in
+/// safe mode, and when the native plugin is missing.
+Future<void> _initAndroidGuardian() async {
+  if (!Platform.isAndroid) return;
+
+  // Keep native alarms in sync with in-app schedule edits.
+  ScheduleStore.instance.addListener(() {
+    unawaited(AndroidLockdown.setSchedule());
+  });
+
+  if (!_setupComplete || AppConfig.simulateLockdown) return;
+  unawaited(() async {
+    await AndroidLockdown.startGuardian();
+    await AndroidLockdown.setSchedule();
+  }());
 }
 
 class SleepTimeApp extends StatelessWidget {

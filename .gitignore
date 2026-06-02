@@ -48,6 +48,11 @@ app.*.map.json
 .env
 .env.*
 
+# Android release signing — never commit a keystore (also in android/.gitignore)
+/android/key.properties
+**/*.keystore
+**/*.jks
+
 # OMC runtime state (per-machine, never commit)
 .omc/
 
