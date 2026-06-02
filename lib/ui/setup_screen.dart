@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/config.dart';
+import '../core/secure_key_store.dart';
 import 'home_screen.dart';
 
 /// First-run setup screen for provider selection / BYOK.
@@ -15,6 +16,7 @@ class SetupScreen extends StatefulWidget {
 class _SetupScreenState extends State<SetupScreen> {
   final _geminiKeyController = TextEditingController();
   final _anthropicKeyController = TextEditingController();
+  final _secureKeyStore = SecureKeyStore();
   bool _loading = false;
   String? _error;
   AiProvider _provider = AiProvider.anthropic;
@@ -50,9 +52,13 @@ class _SetupScreenState extends State<SetupScreen> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('ai_provider', _provider.name);
     await prefs.setBool('use_byok', _useBringYourOwnKey);
-    await prefs.setString('gemini_api_key', _geminiKeyController.text.trim());
-    await prefs.setString(
-      'anthropic_api_key',
+    // API keys go ONLY to encrypted-at-rest secure storage, never plaintext.
+    await _secureKeyStore.write(
+      SecureKeyStore.geminiApiKey,
+      _geminiKeyController.text.trim(),
+    );
+    await _secureKeyStore.write(
+      SecureKeyStore.anthropicApiKey,
       _anthropicKeyController.text.trim(),
     );
     await prefs.setBool('setup_complete', true);

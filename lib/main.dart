@@ -7,6 +7,7 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart' show databaseFactory, datab
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
 import 'core/schedule_store.dart';
+import 'core/secure_key_store.dart';
 import 'core/negotiable_apps.dart';
 import 'core/permission_gating.dart';
 import 'platform/android_lockdown.dart';
@@ -20,6 +21,16 @@ import 'ui/permissions_onboarding_screen.dart';
 const String _simulateLockdownEnv =
     String.fromEnvironment('SIMULATE_LOCKDOWN', defaultValue: '');
 
+/// Compile-time API-key fallbacks (lowest precedence). Kept so a build can bake
+/// in a key via `--dart-define`; they are used but never persisted to secure
+/// storage (they live in the binary, not as a user secret to migrate).
+const String _geminiKeyCompileTime =
+    String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
+const String _anthropicKeyCompileTime =
+    String.fromEnvironment('ANTHROPIC_API_KEY', defaultValue: '');
+const String _pokeKeyCompileTime =
+    String.fromEnvironment('POKE_API_KEY', defaultValue: '');
+
 bool _setupComplete = false;
 
 /// On Android, true when setup is done but the required (hard-gate) permissions
@@ -27,8 +38,9 @@ bool _setupComplete = false;
 /// onboarding screen before treating the guardian as active.
 bool _needsAndroidOnboarding = false;
 
-Future<void> _loadConfig() async {
+Future<void> _loadConfig({SecureKeyStore? secureKeyStore}) async {
   final prefs = await SharedPreferences.getInstance();
+  final secureStore = secureKeyStore ?? SecureKeyStore();
 
   _setupComplete = prefs.getBool('setup_complete') ?? false;
 
@@ -36,12 +48,33 @@ Future<void> _loadConfig() async {
     'CONCIERGE_GEMINI_API_KEY',
     defaultValue: '',
   );
-  AppConfig.geminiApiKey = prefs.getString('gemini_api_key') ??
-      const String.fromEnvironment('GEMINI_API_KEY', defaultValue: '');
-  AppConfig.anthropicApiKey = prefs.getString('anthropic_api_key') ??
-      const String.fromEnvironment('ANTHROPIC_API_KEY', defaultValue: '');
-  AppConfig.pokeApiKey = prefs.getString('poke_api_key') ??
-      const String.fromEnvironment('POKE_API_KEY', defaultValue: '');
+
+  // Load the three secrets from encrypted-at-rest storage, with a one-time
+  // import + migration: env var (runtime) > legacy plaintext prefs > compile
+  // time. Anything imported from env or legacy prefs is persisted to secure
+  // storage; legacy plaintext copies are then scrubbed from SharedPreferences
+  // so the key never lingers in plaintext.
+  AppConfig.geminiApiKey = await _importSecret(
+    store: secureStore,
+    prefs: prefs,
+    key: SecureKeyStore.geminiApiKey,
+    envName: 'GEMINI_API_KEY',
+    compileTimeValue: _geminiKeyCompileTime,
+  );
+  AppConfig.anthropicApiKey = await _importSecret(
+    store: secureStore,
+    prefs: prefs,
+    key: SecureKeyStore.anthropicApiKey,
+    envName: 'ANTHROPIC_API_KEY',
+    compileTimeValue: _anthropicKeyCompileTime,
+  );
+  AppConfig.pokeApiKey = await _importSecret(
+    store: secureStore,
+    prefs: prefs,
+    key: SecureKeyStore.pokeApiKey,
+    envName: 'POKE_API_KEY',
+    compileTimeValue: _pokeKeyCompileTime,
+  );
   AppConfig.useBringYourOwnKey = prefs.getBool('use_byok') ?? true;
 
   AppConfig.aiProvider = AiProvider.anthropic;
@@ -95,6 +128,43 @@ Future<void> _loadConfig() async {
       !AppConfig.simulateLockdown) {
     unawaited(WindowsLockdown.registerStartup());
   }
+}
+
+/// Resolve one secret on boot from secure storage, importing + migrating from
+/// the lower-precedence sources as needed. Returns the resolved value (trimmed,
+/// empty if nothing is available) and performs the side effects:
+///   - env / legacy-pref imports are written into [store] (encrypted at rest)
+///   - a legacy plaintext copy in [prefs] is removed after migration
+/// Compile-time values are used but never persisted.
+Future<String> _importSecret({
+  required SecureKeyStore store,
+  required SharedPreferences prefs,
+  required String key,
+  required String envName,
+  required String compileTimeValue,
+}) async {
+  final decision = resolveKeyImport(
+    secureValue: await store.read(key),
+    envValue: Platform.environment[envName],
+    legacyPrefValue: prefs.getString(key),
+    compileTimeValue: compileTimeValue,
+  );
+
+  switch (decision.source) {
+    case KeyImportSource.env:
+      await store.write(key, decision.value);
+      break;
+    case KeyImportSource.legacyPref:
+      await store.write(key, decision.value);
+      await prefs.remove(key);
+      break;
+    case KeyImportSource.secure:
+    case KeyImportSource.compileTime:
+    case KeyImportSource.none:
+      break;
+  }
+
+  return decision.value;
 }
 
 Future<void> _initWindowManager() async {

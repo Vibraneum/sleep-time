@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/config.dart';
 import '../core/schedule.dart';
 import '../core/schedule_store.dart';
+import '../core/secure_key_store.dart';
 import '../platform/windows_lockdown.dart';
 import 'allowlist_editor_screen.dart';
 import 'permissions_onboarding_screen.dart';
@@ -24,6 +25,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _geminiModelController = TextEditingController();
   final _anthropicModelController = TextEditingController();
   final _safeWordController = TextEditingController();
+
+  final _secureKeyStore = SecureKeyStore();
 
   late AiProvider _provider;
   late bool _useBringYourOwnKey;
@@ -103,12 +106,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     await prefs.setString('ai_provider', _provider.name);
     await prefs.setBool('use_byok', _useBringYourOwnKey);
-    await prefs.setString('gemini_api_key', _geminiKeyController.text.trim());
-    await prefs.setString(
-      'anthropic_api_key',
+    // API keys are written ONLY to encrypted-at-rest secure storage, never to
+    // plaintext SharedPreferences.
+    await _secureKeyStore.write(
+      SecureKeyStore.geminiApiKey,
+      _geminiKeyController.text.trim(),
+    );
+    await _secureKeyStore.write(
+      SecureKeyStore.anthropicApiKey,
       _anthropicKeyController.text.trim(),
     );
-    await prefs.setString('poke_api_key', _pokeKeyController.text.trim());
+    await _secureKeyStore.write(
+      SecureKeyStore.pokeApiKey,
+      _pokeKeyController.text.trim(),
+    );
     await prefs.setString('gemini_model', _geminiModelController.text.trim());
     await prefs.setString(
       'anthropic_model',
