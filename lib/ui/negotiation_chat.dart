@@ -101,6 +101,48 @@ class _NegotiationChatState extends State<NegotiationChat> {
   /// is in flight. Deltas mutate this bubble's text in place.
   _ChatMessage? _streamingBubble;
 
+  /// Streaming UI throttle. On Windows desktop, calling setState on every token
+  /// tears down/recreates the active text-input connection, so the TextField
+  /// the user is typing into loses focus and eats characters. Instead of one
+  /// setState per token we buffer the latest [partial] in [_pendingPartial] and
+  /// flush it to the bubble at most once per [_streamFlushInterval] (~14 fps).
+  Timer? _streamFlushTimer;
+  String? _pendingPartial;
+  static const Duration _streamFlushInterval = Duration(milliseconds: 70);
+
+  /// Coalesce a streamed [partial] for [bubble]. Stores the latest text and, if
+  /// no flush is already scheduled, schedules ONE flush in [_streamFlushInterval]
+  /// that applies the most recent partial in a single setState + scroll. Timers
+  /// are never stacked — a pending timer absorbs all intervening tokens.
+  void _onStreamDelta(_ChatMessage bubble, int generation, String partial) {
+    if (!mounted || generation != _streamGeneration) return;
+    _pendingPartial = partial;
+    if (_streamFlushTimer != null) return;
+    _streamFlushTimer = Timer(_streamFlushInterval, () {
+      _streamFlushTimer = null;
+      _flushStream(bubble, generation);
+    });
+  }
+
+  /// Apply the latest buffered partial to [bubble] in one setState and scroll
+  /// once. No-op if the stream was superseded (e.g. safe word fired).
+  void _flushStream(_ChatMessage bubble, int generation) {
+    final pending = _pendingPartial;
+    _pendingPartial = null;
+    if (pending == null) return;
+    if (!mounted || generation != _streamGeneration) return;
+    setState(() => bubble.text = pending);
+    _scrollToBottom();
+  }
+
+  /// Stop the flush throttle and drop any buffered partial. Called before the
+  /// final text is applied in one setState so the last tokens always land.
+  void _stopStreamFlush() {
+    _streamFlushTimer?.cancel();
+    _streamFlushTimer = null;
+    _pendingPartial = null;
+  }
+
   /// Monotonic id for the in-flight stream. The safe word (which can fire
   /// mid-stream) bumps this so any still-arriving deltas / the finalize step
   /// for the previous turn become no-ops and never clobber the safe-word UI.
@@ -159,12 +201,9 @@ class _NegotiationChatState extends State<NegotiationChat> {
     try {
       final decision = await widget.engine.negotiateProactive(
         ProactiveTrigger.silence,
-        onDelta: (partial) {
-          if (!mounted || generation != _streamGeneration) return;
-          setState(() => bubble.text = partial);
-          _scrollToBottom();
-        },
+        onDelta: (partial) => _onStreamDelta(bubble, generation, partial),
       );
+      _stopStreamFlush();
       if (!mounted || generation != _streamGeneration) return;
       setState(() {
         bubble
@@ -175,6 +214,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
       });
       _scrollToBottom();
     } catch (_) {
+      _stopStreamFlush();
       if (mounted && generation == _streamGeneration) {
         setState(() {
           // Drop the empty streaming bubble on a failed silence ping.
@@ -213,12 +253,9 @@ class _NegotiationChatState extends State<NegotiationChat> {
       _scrollToBottom();
       final decision = await widget.engine.negotiateProactive(
         ProactiveTrigger.open,
-        onDelta: (partial) {
-          if (!mounted || generation != _streamGeneration) return;
-          setState(() => bubble.text = partial);
-          _scrollToBottom();
-        },
+        onDelta: (partial) => _onStreamDelta(bubble, generation, partial),
       );
+      _stopStreamFlush();
       if (mounted && generation == _streamGeneration) {
         setState(() {
           bubble
@@ -228,6 +265,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
         });
       }
     } catch (_) {
+      _stopStreamFlush();
       // Drop any half-built streaming bubble before showing the fallback.
       if (_streamingBubble != null) {
         _messages.remove(_streamingBubble);
@@ -267,6 +305,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
       // Cancel any in-flight stream: bump the generation so its deltas/finalize
       // become no-ops, and detach the streaming bubble so the safe-word UI wins.
       _streamGeneration++;
+      _stopStreamFlush();
       setState(() {
         _streamingBubble = null;
         _messages.add(_ChatMessage(text: text, isUser: true));
@@ -302,13 +341,9 @@ class _NegotiationChatState extends State<NegotiationChat> {
     try {
       final decision = await widget.engine.negotiate(
         text,
-        onDelta: (partial) {
-          // Ignore deltas from a superseded stream (e.g. safe word fired).
-          if (!mounted || generation != _streamGeneration) return;
-          setState(() => bubble.text = partial);
-          _scrollToBottom();
-        },
+        onDelta: (partial) => _onStreamDelta(bubble, generation, partial),
       );
+      _stopStreamFlush();
       // A superseded stream (safe word mid-flight) must not clobber the UI.
       if (!mounted || generation != _streamGeneration) return;
       setState(() {
@@ -370,6 +405,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
         }
       }
     } catch (e) {
+      _stopStreamFlush();
       // Don't clobber the UI if this stream was superseded (safe word).
       if (mounted && generation == _streamGeneration) {
         setState(() {
@@ -383,7 +419,9 @@ class _NegotiationChatState extends State<NegotiationChat> {
     }
 
     _scrollToBottom();
-    if (!_negotiationOver) _focusNode.requestFocus();
+    // Don't re-grab focus when the field already has it — re-requesting resets
+    // the IME/selection on a field the user may already be typing in.
+    if (!_negotiationOver && !_focusNode.hasFocus) _focusNode.requestFocus();
   }
 
   /// Track consecutive offline / missing-key replies. The engine now flags
@@ -440,6 +478,7 @@ class _NegotiationChatState extends State<NegotiationChat> {
   @override
   void dispose() {
     _heartbeat?.cancel();
+    _streamFlushTimer?.cancel();
     _controller.dispose();
     _scrollController.dispose();
     // Only dispose a focus node we created. A host-supplied node is owned by
@@ -481,6 +520,11 @@ class _NegotiationChatState extends State<NegotiationChat> {
             children: [
               Expanded(
                 child: TextField(
+                  // Stable key so Flutter preserves the same element + active
+                  // text-input connection across the high-frequency streaming
+                  // rebuilds, instead of recycling the element (which drops
+                  // focus and eats characters).
+                  key: const ValueKey('guardian_input'),
                   controller: _controller,
                   focusNode: _focusNode,
                   enabled: !_negotiationOver,

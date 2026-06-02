@@ -311,7 +311,11 @@ class _LockdownScreenState extends State<LockdownScreen>
     // typing-eaten fix.
     if (_showChat) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted && _showChat) _chatFocusNode.requestFocus();
+        // Don't re-grab focus if the field already has it — re-requesting would
+        // reset the IME/selection on a field the user is actively typing in.
+        if (mounted && _showChat && !_chatFocusNode.hasFocus) {
+          _chatFocusNode.requestFocus();
+        }
       });
     }
   }

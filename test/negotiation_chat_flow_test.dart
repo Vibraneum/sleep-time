@@ -23,6 +23,33 @@ class _StuckEngine extends NegotiationEngine {
   }
 }
 
+/// Engine that drives a burst of streamed [onDelta] updates synchronously and
+/// then returns a final decision. Lets us prove the streaming UI throttle
+/// coalesces rapid tokens without dropping the last one (#1 throttle), and that
+/// the input field's element identity / focus survives a streamed reply.
+class _StreamingEngine extends NegotiationEngine {
+  final List<String> deltas;
+  final String finalMessage;
+
+  _StreamingEngine({required this.deltas, required this.finalMessage});
+
+  @override
+  Future<GuardianDecision> negotiate(
+    String userMessage, {
+    void Function(String partialMessage)? onDelta,
+  }) async {
+    if (onDelta != null) {
+      for (final d in deltas) {
+        onDelta(d);
+      }
+    }
+    return GuardianDecision(
+      message: finalMessage,
+      action: GuardianAction.none,
+    );
+  }
+}
+
 /// End-to-end widget coverage of the negotiation loop: a user types into the
 /// real chat UI, the engine returns a decision, and the screen dispatches the
 /// matching action callback. Uses the debug `solara` grant bypass and the safe
@@ -201,6 +228,90 @@ void main() {
         message: 'late',
         action: GuardianAction.none,
       ));
+    });
+  });
+
+  testWidgets(
+      'streaming throttle coalesces a delta burst without dropping the last token',
+      (tester) async {
+    await tester.runAsync(() async {
+      final engine = _StreamingEngine(
+        deltas: const ['a', 'ab', 'abc', 'abcd', 'abcde'],
+        finalMessage: 'abcdef',
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: NegotiationChat(
+              engine: engine,
+              grantsUsedTonight: 0,
+              onGranted: (_) {},
+            ),
+          ),
+        ),
+      );
+      await settleGreeting(tester);
+
+      await tester.enterText(find.byType(TextField), 'please five minutes');
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+
+      // Let the final setState (post-stream) and the ~70ms throttle settle.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await tester.pump();
+
+      // The final message must always land in full — coalescing must not drop
+      // the last token.
+      expect(find.textContaining('abcdef'), findsOneWidget,
+          reason: 'final streamed text must always be applied in full');
+    });
+  });
+
+  testWidgets(
+      '#3/#4 input element identity is stable across a streamed reply',
+      (tester) async {
+    await tester.runAsync(() async {
+      final engine = _StreamingEngine(
+        deltas: List<String>.generate(40, (i) => 'tok' * (i + 1)),
+        finalMessage: 'done streaming',
+      );
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: NegotiationChat(
+              engine: engine,
+              grantsUsedTonight: 0,
+              onGranted: (_) {},
+            ),
+          ),
+        ),
+      );
+      await settleGreeting(tester);
+
+      final inputFinder = find.byKey(const ValueKey('guardian_input'));
+      expect(inputFinder, findsOneWidget,
+          reason: 'input must carry the stable ValueKey');
+
+      // Capture the live Element backing the input before the stream.
+      final elementBefore = tester.element(inputFinder);
+
+      // Focus the field, then drive a streamed guardian reply.
+      FocusScope.of(elementBefore).requestFocus(
+        tester.widget<TextField>(inputFinder).focusNode,
+      );
+      await tester.pump();
+
+      await tester.enterText(inputFinder, 'keep my focus please');
+      await tester.testTextInput.receiveAction(TextInputAction.send);
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      await tester.pump();
+
+      // The element backing the keyed input must be the SAME instance after the
+      // stream (no element recycling), so the text-input connection is never
+      // torn down and focus/characters are never lost.
+      final elementAfter = tester.element(inputFinder);
+      expect(identical(elementBefore, elementAfter), isTrue,
+          reason: 'stable key must preserve the same input element across '
+              'streaming rebuilds');
     });
   });
 }
