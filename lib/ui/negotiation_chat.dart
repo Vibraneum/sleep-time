@@ -9,6 +9,8 @@ class NegotiationChat extends StatefulWidget {
   final void Function()? onMinimize;
   final void Function()? onClose;
   final void Function()? onUnlock;
+  final void Function(String identifier, int minutes)? onUnlockApp;
+  final void Function(GuardianDecision decision)? onAdjustSchedule;
 
   const NegotiationChat({
     super.key,
@@ -18,6 +20,8 @@ class NegotiationChat extends StatefulWidget {
     this.onMinimize,
     this.onClose,
     this.onUnlock,
+    this.onUnlockApp,
+    this.onAdjustSchedule,
   });
 
   @override
@@ -106,8 +110,12 @@ class _NegotiationChatState extends State<NegotiationChat> {
         _isLoading = false;
       });
 
-      if (decision.action != GuardianAction.none &&
-          decision.action != GuardianAction.deny) {
+      // adjustSchedule stays in chat (like deny) — application is M3.
+      final isTerminal = decision.action != GuardianAction.none &&
+          decision.action != GuardianAction.deny &&
+          decision.action != GuardianAction.adjustSchedule;
+
+      if (isTerminal) {
         _negotiationOver = true;
         await Future.delayed(const Duration(seconds: 2));
         switch (decision.action) {
@@ -119,9 +127,18 @@ class _NegotiationChatState extends State<NegotiationChat> {
             widget.onClose?.call();
           case GuardianAction.unlock:
             widget.onUnlock?.call();
+          case GuardianAction.unlockApp:
+            widget.onUnlockApp?.call(
+              decision.appIdentifier ?? '',
+              decision.appMinutes ?? 0,
+            );
           default:
             break;
         }
+      } else if (decision.action == GuardianAction.adjustSchedule) {
+        // TODO(M3): apply the schedule change with guardrails. For now just
+        // surface the message (already shown) and stay in the chat.
+        widget.onAdjustSchedule?.call(decision);
       }
     } catch (e) {
       setState(() {

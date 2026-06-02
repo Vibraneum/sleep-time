@@ -1,11 +1,18 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sleep_time/core/config.dart';
-import 'package:sleep_time/core/negotiation_engine.dart';
+import 'package:sleep_time/core/guardian_tools.dart';
+
+// The legacy text parser moved to guardian_tools.dart and was renamed
+// parseGeminiDecision/cleanGeminiResponse. These assertions migrated from the
+// original negotiation_engine_test.dart so the Gemini fallback stays covered
+// regardless of which file a reader opens. The Anthropic tool-use path and the
+// request body shape are covered in guardian_tools_test.dart and
+// anthropic_request_test.dart.
 
 void main() {
-  group('Negotiation parsing', () {
+  group('Negotiation parsing (Gemini legacy fallback)', () {
     test('parses grant decisions and clamps absurd minutes', () {
-      final decision = parseGuardianDecision(
+      final decision = parseGeminiDecision(
         'fine. but this is ridiculous.\n{"decision": "grant", "minutes": 999}',
       );
 
@@ -15,7 +22,7 @@ void main() {
     });
 
     test('parses deny decisions and strips json line', () {
-      final decision = parseGuardianDecision(
+      final decision = parseGeminiDecision(
         'no. go to sleep.\n{"decision": "deny"}',
       );
 
@@ -25,10 +32,17 @@ void main() {
     });
 
     test('falls back to plain text when no json exists', () {
-      final decision = parseGuardianDecision('absolutely not.');
+      final decision = parseGeminiDecision('absolutely not.');
 
       expect(decision.granted, isFalse);
       expect(decision.message, 'absolutely not.');
+    });
+
+    test('cleanGeminiResponse strips the decision line', () {
+      final cleaned = cleanGeminiResponse(
+        'ten minutes.\n{"decision": "grant", "minutes": 10}',
+      );
+      expect(cleaned, 'ten minutes.');
     });
   });
 }

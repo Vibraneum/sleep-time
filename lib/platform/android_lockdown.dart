@@ -14,6 +14,21 @@ class AndroidLockdown {
 
   static bool get _simulating => AppConfig.simulateLockdown;
 
+  /// Whether the native Android lockdown side is wired up. Callers that would
+  /// dispatch minimize/close/unlock_app on Android should degrade to
+  /// message-only when this returns false. The actual native implementation
+  /// lands in M4/M5; until then a `ping` will throw MissingPluginException.
+  static Future<bool> isNativeReady() async {
+    if (!Platform.isAndroid) return false;
+    try {
+      return await _channel.invokeMethod('ping') ?? false;
+    } on MissingPluginException {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// Request Device Admin permission (must be done once during setup).
   static Future<bool> requestDeviceAdmin() async {
     if (!Platform.isAndroid) return false;
