@@ -7,10 +7,13 @@ import 'package:sqflite_common_ffi/sqflite_ffi.dart' show databaseFactory, datab
 import 'package:window_manager/window_manager.dart';
 import 'core/config.dart';
 import 'core/schedule_store.dart';
+import 'core/negotiable_apps.dart';
+import 'core/permission_gating.dart';
 import 'platform/android_lockdown.dart';
 import 'platform/windows_lockdown.dart';
 import 'ui/home_screen.dart';
 import 'ui/setup_screen.dart';
+import 'ui/permissions_onboarding_screen.dart';
 
 /// Compile-time override for safe / simulate mode.
 /// Pass `--dart-define=SIMULATE_LOCKDOWN=true|false` to flip it.
@@ -18,6 +21,11 @@ const String _simulateLockdownEnv =
     String.fromEnvironment('SIMULATE_LOCKDOWN', defaultValue: '');
 
 bool _setupComplete = false;
+
+/// On Android, true when setup is done but the required (hard-gate) permissions
+/// for the background guardian are not yet granted, so we route through the
+/// onboarding screen before treating the guardian as active.
+bool _needsAndroidOnboarding = false;
 
 Future<void> _loadConfig() async {
   final prefs = await SharedPreferences.getInstance();
@@ -120,6 +128,7 @@ Future<void> main() async {
 
   await ScheduleStore.instance.loadFromPrefs();
   await _loadConfig();
+  await NegotiableAppStore.instance.load();
   await _initAndroidGuardian();
   runApp(const SleepTimeApp());
 }
@@ -141,6 +150,17 @@ Future<void> _initAndroidGuardian() async {
   });
 
   if (!_setupComplete || AppConfig.simulateLockdown) return;
+
+  // The guardian is only meaningfully "active" once the required permissions
+  // (overlay + usage access + exact alarm) are granted. If they are missing,
+  // route the user through onboarding first instead of silently starting a
+  // guardian that cannot enforce.
+  final status = await AndroidLockdown.getPermissionStatus();
+  if (!PermissionGating.canFinish(status)) {
+    _needsAndroidOnboarding = true;
+    return;
+  }
+
   unawaited(() async {
     await AndroidLockdown.startGuardian();
     await AndroidLockdown.setSchedule();
@@ -164,7 +184,35 @@ class SleepTimeApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: _setupComplete ? const HomeScreen() : const SetupScreen(),
+      home: !_setupComplete
+          ? const SetupScreen()
+          : _needsAndroidOnboarding
+              ? const _AndroidOnboardingGate()
+              : const HomeScreen(),
+    );
+  }
+}
+
+/// First-run gate: shows the permission onboarding, then activates the native
+/// guardian and replaces itself with the home screen once the required
+/// permissions are satisfied.
+class _AndroidOnboardingGate extends StatelessWidget {
+  const _AndroidOnboardingGate();
+
+  @override
+  Widget build(BuildContext context) {
+    return PermissionsOnboardingScreen(
+      onComplete: () {
+        _needsAndroidOnboarding = false;
+        unawaited(() async {
+          await AndroidLockdown.startGuardian();
+          await AndroidLockdown.setSchedule();
+        }());
+        Navigator.of(context).pushAndRemoveUntil(
+          MaterialPageRoute(builder: (_) => const HomeScreen()),
+          (_) => false,
+        );
+      },
     );
   }
 }

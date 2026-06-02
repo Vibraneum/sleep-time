@@ -38,7 +38,9 @@ class SleepGuardianService : Service() {
         const val ACTION_START = "com.vedastro.sleep_time.guardian.START"
         const val ACTION_STOP = "com.vedastro.sleep_time.guardian.STOP"
         const val ACTION_EVALUATE = "com.vedastro.sleep_time.guardian.EVALUATE"
+        const val ACTION_FOREGROUND_APP = "com.vedastro.sleep_time.guardian.FG_APP"
         const val EXTRA_ALARM_ACTION = "alarm_action"
+        const val EXTRA_FOREGROUND_PACKAGE = "foreground_package"
 
         // Broadcast to the MainActivity EventChannel bridge.
         const val BROADCAST_STATE = "com.vedastro.sleep_time.guardian.STATE"
@@ -74,6 +76,21 @@ class SleepGuardianService : Service() {
             startService(context, intent)
         }
 
+        /**
+         * Optional fast path from [SleepAccessibilityService]: feed a freshly
+         * observed foreground package into the (UsageStats-primary) evaluation.
+         * No-op unless the service is already running.
+         */
+        fun onAccessibilityForeground(context: Context, pkg: String) {
+            val intent = Intent(context, SleepGuardianService::class.java)
+                .setAction(ACTION_FOREGROUND_APP)
+                .putExtra(EXTRA_FOREGROUND_PACKAGE, pkg)
+            try {
+                startService(context, intent)
+            } catch (_: Exception) {
+            }
+        }
+
         private fun startService(context: Context, intent: Intent) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
@@ -85,11 +102,30 @@ class SleepGuardianService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    // M5 enforcement collaborators. Created lazily; only the watcher polls, and
+    // only while actively enforcing.
+    private val overlay by lazy { OverlayController(this) }
+    private var watcher: ForegroundAppWatcher? = null
+    private var enforcing = false
+    private var bannerHandler: android.os.Handler? = null
+    private var bannerTick: Runnable? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
                 stopGuardian()
                 return START_NOT_STICKY
+            }
+            ACTION_FOREGROUND_APP -> {
+                // Always keep foreground status valid before doing work.
+                ensureForeground()
+                val pkg = intent.getStringExtra(EXTRA_FOREGROUND_PACKAGE)
+                if (pkg != null) {
+                    // Feed the optional accessibility signal into the same
+                    // watcher path used by the primary UsageStats poll.
+                    watcher?.pushAccessibilityPackage(pkg)
+                    if (enforcing) handleForegroundApp(pkg)
+                }
             }
             else -> {
                 // Always promote to foreground within the 10s window first.
@@ -101,6 +137,11 @@ class SleepGuardianService : Service() {
         // START_STICKY: if the OS kills us, restart with a null intent and we
         // re-promote + re-evaluate from the current schedule.
         return START_STICKY
+    }
+
+    override fun onDestroy() {
+        stopEnforcement()
+        super.onDestroy()
     }
 
     private fun ensureForeground() {
@@ -118,9 +159,11 @@ class SleepGuardianService : Service() {
     }
 
     /**
-     * Re-derive the current state from the schedule and broadcast it. The
-     * escalation seam for M5 (overlay / per-app blocking) lives here; in M4 we
-     * only update the notification text and emit state.
+     * Re-derive the current state from the schedule, arm/disarm the M5
+     * enforcement (UsageStats watcher + overlay), and broadcast state.
+     *
+     * Enforcement only runs when locked AND not in safe mode. Safe mode keeps
+     * everything honest: notification only, no overlay, no watcher.
      */
     private fun evaluate(alarmAction: String?) {
         val schedule = SleepScheduleStore.read(this)
@@ -135,14 +178,118 @@ class SleepGuardianService : Service() {
 
         updateNotification(state)
 
-        // M5 escalation seam: when !simulating && state == STATE_LOCKED, the
-        // overlay / AccessibilityService blocking would arm here. In M4 there
-        // is nothing to escalate; safe mode short-circuits future effects.
+        // M5 escalation. Honor safe mode: no overlay / watcher when simulating.
         if (!simulating && state == STATE_LOCKED) {
-            // no-op in M4 (notification already posted) — M5 fills this in.
+            startEnforcement()
+            // Re-evaluate the foreground immediately on each transition.
+            val pkg = watcher?.latestForegroundPackage()
+            if (pkg != null) handleForegroundApp(pkg)
+        } else {
+            stopEnforcement()
         }
 
         broadcastState(state)
+    }
+
+    // -------------------------------------------------------------------------
+    // M5 enforcement: UsageStats-primary foreground watch + overlay escalation.
+    // -------------------------------------------------------------------------
+
+    private fun startEnforcement() {
+        if (enforcing) return
+        enforcing = true
+        AllowListManager.purgeExpired(this)
+        val w = ForegroundAppWatcher(this).apply {
+            onForegroundPackage = { pkg -> handleForegroundApp(pkg) }
+        }
+        watcher = w
+        w.start()
+    }
+
+    private fun stopEnforcement() {
+        if (!enforcing && watcher == null) {
+            overlay.hideAll()
+            return
+        }
+        enforcing = false
+        watcher?.stop()
+        watcher = null
+        stopBannerTicker()
+        overlay.hideAll()
+    }
+
+    /**
+     * The single evaluation entry point used by BOTH the primary UsageStats
+     * poll and the optional accessibility nudge. Allowed apps (own app, the
+     * launcher, or an active allow-list grant) get the slim countdown banner;
+     * anything else gets the full blocking overlay (or the activity-to-front
+     * fallback).
+     */
+    private fun handleForegroundApp(pkg: String) {
+        if (!enforcing) return
+        if (SleepScheduleStore.isSimulating(this)) return
+
+        AllowListManager.purgeExpired(this)
+        val allowed = AllowListManager.isAllowed(this, pkg)
+        val hasGrant = AllowListManager.activeEntries(this).isNotEmpty()
+
+        if (allowed) {
+            overlay.hideFullBlock()
+            if (hasGrant && pkg != packageName) {
+                startBannerTicker()
+            } else {
+                stopBannerTicker()
+                overlay.hideBanner()
+            }
+        } else {
+            stopBannerTicker()
+            overlay.showFullBlock()
+        }
+    }
+
+    /** Keep the grant countdown banner's text fresh once a second. */
+    private fun startBannerTicker() {
+        if (bannerTick != null) {
+            // Already running; just refresh now.
+            updateBanner()
+            return
+        }
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        bannerHandler = handler
+        val tick = object : Runnable {
+            override fun run() {
+                if (!enforcing) return
+                val stillGranted = updateBanner()
+                if (!stillGranted) {
+                    // Grant expired → re-evaluate (likely re-block).
+                    stopBannerTicker()
+                    val pkg = watcher?.latestForegroundPackage()
+                    if (pkg != null) handleForegroundApp(pkg)
+                    return
+                }
+                handler.postDelayed(this, 1_000L)
+            }
+        }
+        bannerTick = tick
+        handler.post(tick)
+    }
+
+    private fun stopBannerTicker() {
+        bannerTick?.let { bannerHandler?.removeCallbacks(it) }
+        bannerTick = null
+        bannerHandler = null
+    }
+
+    /** Returns true while a grant is still active. */
+    private fun updateBanner(): Boolean {
+        val expiry = AllowListManager.nextExpiryMillis(this)
+        val remaining = expiry - System.currentTimeMillis()
+        if (expiry == 0L || remaining <= 0L) return false
+        val totalSec = remaining / 1000L
+        val mm = (totalSec / 60).toString().padStart(2, '0')
+        val ss = (totalSec % 60).toString().padStart(2, '0')
+        overlay.showBanner("$mm:$ss")
+        return true
     }
 
     private fun broadcastState(state: String) {
@@ -155,6 +302,7 @@ class SleepGuardianService : Service() {
     }
 
     private fun stopGuardian() {
+        stopEnforcement()
         SleepAlarmScheduler.cancelAll(this)
         broadcastState(STATE_INACTIVE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {

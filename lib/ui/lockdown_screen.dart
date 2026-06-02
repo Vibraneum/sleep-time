@@ -7,11 +7,15 @@ import '../core/lockdown_scheduler.dart';
 import '../core/negotiation_engine.dart';
 import '../core/config.dart';
 import '../core/schedule_store.dart';
+import '../core/negotiable_apps.dart';
 import '../platform/windows_lockdown.dart';
 import '../platform/windows_lock_state.dart';
+import '../platform/android_lockdown.dart';
 import 'negotiation_chat.dart';
 import 'home_screen.dart';
 import 'settings_screen.dart';
+import 'overlay/overlay_shell.dart';
+import 'overlay/overlay_size.dart';
 
 class LockdownScreen extends StatefulWidget {
   final LockdownScheduler scheduler;
@@ -27,6 +31,11 @@ class _LockdownScreenState extends State<LockdownScreen>
   final _keyboardFocusNode = FocusNode();
   bool _showChat = false;
   late AnimationController _pulseController;
+
+  /// When set, the active grant is a per-app unlock (Android selective unlock):
+  /// the granted view shows the borrowed app's friendly name instead of the
+  /// generic full-grant countdown.
+  String? _grantedAppLabel;
 
   @override
   void initState() {
@@ -56,7 +65,10 @@ class _LockdownScreenState extends State<LockdownScreen>
 
   void _onGranted(int minutes) {
     widget.scheduler.grantExtension(minutes);
-    setState(() => _showChat = false);
+    setState(() {
+      _grantedAppLabel = null;
+      _showChat = false;
+    });
   }
 
   Future<void> _onMinimize(int minutes) async {
@@ -73,11 +85,22 @@ class _LockdownScreenState extends State<LockdownScreen>
   }
 
   /// Selective per-app unlock: keep the overlay armed but allow [identifier]
-  /// (a friendly name or image name) for [minutes]. Resolution to an image
-  /// name happens in [WindowsLockdown] via the scheduler's onSelectiveGrant.
-  void _onUnlockApp(String identifier, int minutes) {
-    final allow = WindowsAppResolver.resolveAll([identifier]);
+  /// (a friendly name, package, or image name) for [minutes].
+  ///
+  /// On Windows, resolution to an image name happens in [WindowsLockdown] via
+  /// the scheduler's onSelectiveGrant. On Android, the identifier is resolved to
+  /// a package against the installed-app catalog and added to the native
+  /// time-limited allow-list — but ONLY if it is on the user-approved
+  /// negotiable-apps list (the guardian cannot free arbitrary apps).
+  Future<void> _onUnlockApp(String identifier, int minutes) async {
     final grantMinutes = minutes > 0 ? minutes : AppConfig.minGrantedMinutes;
+
+    if (Platform.isAndroid) {
+      await _onUnlockAppAndroid(identifier, grantMinutes);
+      return;
+    }
+
+    final allow = WindowsAppResolver.resolveAll([identifier]);
     if (allow.isEmpty) {
       // Nothing resolvable — degrade to a normal timed grant rather than
       // silently doing nothing.
@@ -86,6 +109,34 @@ class _LockdownScreenState extends State<LockdownScreen>
     }
     widget.scheduler.grantSelective(allow: allow, minutes: grantMinutes);
     setState(() => _showChat = false);
+  }
+
+  Future<void> _onUnlockAppAndroid(String identifier, int minutes) async {
+    // Constrain to the user-approved negotiable-apps set: the guardian can only
+    // unlock apps the user explicitly added in Settings.
+    final resolved = NegotiableAppStore.instance.resolve(identifier);
+    if (resolved == null) {
+      // Not on the approved negotiable-apps list (or unresolvable). Degrade to a
+      // normal timed grant so the guardian's decision still does *something*
+      // honest rather than silently allowing an unapproved app.
+      widget.scheduler.grantExtension(minutes);
+      return;
+    }
+    final ok = await AndroidLockdown.allowApp(
+      package: resolved.package,
+      minutes: minutes,
+      label: resolved.label,
+    );
+    if (!mounted) return;
+    if (!ok) {
+      widget.scheduler.grantExtension(minutes);
+      return;
+    }
+    widget.scheduler.grantSelective(allow: [resolved.package], minutes: minutes);
+    setState(() {
+      _grantedAppLabel = resolved.label;
+      _showChat = false;
+    });
   }
 
   Future<void> _onClose() async {
@@ -386,48 +437,62 @@ class _LockdownScreenState extends State<LockdownScreen>
   }
 
   Widget _buildGrantedView() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          const Icon(Icons.timer_outlined, size: 48, color: Color(0xFFFF9500)),
-          const SizedBox(height: 24),
-          Text(
-            'Extension granted',
-            style: TextStyle(
-              color: Colors.white.withAlpha(140),
-              fontSize: 14,
-              letterSpacing: 2,
-            ),
-          ),
-          const SizedBox(height: 16),
-          StreamBuilder(
-            stream: Stream.periodic(const Duration(seconds: 1)),
-            builder: (context, _) {
-              final remaining = widget.scheduler.grantRemaining;
-              if (remaining == null) return const SizedBox.shrink();
-              final mins = remaining.inMinutes;
-              final secs = remaining.inSeconds % 60;
-              final urgent = remaining.inMinutes < 2;
-              return Text(
-                '${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}',
-                style: TextStyle(
-                  color: urgent
-                      ? const Color(0xFFFF3B30)
-                      : const Color(0xFFFF9500),
-                  fontSize: 52,
-                  fontWeight: FontWeight.w200,
-                  letterSpacing: 4,
+    final perApp = _grantedAppLabel != null;
+    return SafeArea(
+      child: StreamBuilder(
+        stream: Stream.periodic(const Duration(seconds: 1)),
+        builder: (context, _) {
+          final remaining = widget.scheduler.grantRemaining;
+          // A per-app grant folds into a corner mini pill (the app is usable
+          // behind it); a full grant folds to a corner mini countdown too, per
+          // the "fold-to-corner countdown" spec.
+          final size = OverlaySizing.select(
+            locked: false,
+            granted: true,
+            perAppGrant: perApp,
+            foldToCorner: true,
+          );
+          return Stack(
+            children: [
+              Positioned(
+                top: 16,
+                right: 16,
+                child: OverlayShell(
+                  size: size,
+                  remaining: remaining,
+                  appLabel: _grantedAppLabel,
+                  onTapExpand: () => setState(() => _showChat = true),
+                  onEndEarly: _onUnlock,
                 ),
-              );
-            },
-          ),
-          const SizedBox(height: 8),
-          Text(
-            'remaining',
-            style: TextStyle(color: Colors.white.withAlpha(50), fontSize: 12),
-          ),
-        ],
+              ),
+              // A gentle label so a full-screen grant view isn't just an empty
+              // dark canvas with a corner pill.
+              Center(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      perApp ? Icons.apps_rounded : Icons.timer_outlined,
+                      size: 44,
+                      color: const Color(0xFFFF9500),
+                    ),
+                    const SizedBox(height: 20),
+                    Text(
+                      perApp
+                          ? '${_grantedAppLabel!} unlocked'
+                          : 'Extension granted',
+                      style: TextStyle(
+                        color: Colors.white.withAlpha(140),
+                        fontSize: 14,
+                        letterSpacing: 2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

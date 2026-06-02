@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The native full-screen blocking overlay shown over a disallowed app while the
+  bedtime lock is active. Intentionally minimal: the rich negotiation UI lives in
+  the Flutter MainActivity, which the "Open Sleep Time" button brings to front.
+  Dark calm bedtime surface; the single CTA is indigo (not red) per the caring
+  tone — red is reserved for the in-app final countdown only.
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0D0D1A"
+    android:fitsSystemWindows="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:paddingStart="32dp"
+        android:paddingEnd="32dp">
+
+        <TextView
+            android:id="@+id/overlay_title"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="It's bedtime"
+            android:textColor="#FFFFFFFF"
+            android:textSize="28sp"
+            android:textStyle="normal"
+            android:letterSpacing="0.05" />
+
+        <TextView
+            android:id="@+id/overlay_subtitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
+            android:gravity="center"
+            android:text="This app is resting until morning. Tap below if you really need to talk to your guardian."
+            android:textColor="#99FFFFFF"
+            android:textSize="15sp"
+            android:lineSpacingMultiplier="1.3" />
+
+        <TextView
+            android:id="@+id/overlay_open_button"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="40dp"
+            android:background="#5B5FEF"
+            android:paddingStart="28dp"
+            android:paddingEnd="28dp"
+            android:paddingTop="14dp"
+            android:paddingBottom="14dp"
+            android:text="Open Sleep Time"
+            android:textColor="#FFFFFFFF"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:clickable="true"
+            android:focusable="true" />
+    </LinearLayout>
+</FrameLayout>

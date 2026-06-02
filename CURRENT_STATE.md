@@ -78,22 +78,15 @@ Resolution order on app start:
 
 ## Android status
 
-Android has native method-channel scaffolding for:
-- device admin requests
-- lock-task / screen pinning
-- unlock / relock flow
+> Superseded by the **Android (Play-compliant) architecture — M4** and
+> **Android M5** sections below. The old Device Admin + lock-task / screen-pinning
+> scaffolding has been **removed entirely** (guaranteed Play rejection). Android
+> no longer uses any device-admin or kiosk APIs.
 
-The manifest now also declares the runtime permissions a real mobile build needs:
-- `WAKE_LOCK` (keep the screen on during lockdown)
-- `POST_NOTIFICATIONS` (Android 13+ runtime notification gate)
-- `USE_FULL_SCREEN_INTENT` (high-priority lockdown alert)
-- `FOREGROUND_SERVICE_SPECIAL_USE` (Android 14+ typed FGS)
-- `SCHEDULE_EXACT_ALARM` / `USE_EXACT_ALARM` (future exact-alarm scheduler)
-
-Still missing for production on Android:
-- a persistent foreground service so the scheduler keeps firing after the app is backgrounded / evicted
-- exact-alarm scheduling for wake / wind-down / lockdown / unlock transitions
-- the in-app `POST_NOTIFICATIONS` runtime prompt
+The Android background layer is now a `specialUse` foreground service driven by
+exact alarms (M4), with a Play-compliant per-app lock overlay backed by
+UsageStats as the primary foreground-app detector (M5). See those sections for
+detail.
 
 iOS is not yet supported (no `ios/` runner). A real iOS port would need to use the Screen Time API rather than try to emulate the Windows model.
 
@@ -179,10 +172,11 @@ exact alarms, with WorkManager-based boot recovery.
   lockTask code removed.
 
 ### Channel surface
-- MethodChannel methods: `ping`, `startGuardian`, `stopGuardian`,
+- MethodChannel methods (M4): `ping`, `startGuardian`, `stopGuardian`,
   `getPermissionStatus`, `setSchedule`, `requestExactAlarm`,
-  `requestNotifications`, `requestBatteryExemption`, plus M5 stubs
-  `requestOverlay` / `requestUsageAccess` / `allowApp` (return false).
+  `requestNotifications`, `requestBatteryExemption`. The former M5 stubs
+  (`requestOverlay` / `requestUsageAccess` / `allowApp`) are now implemented;
+  see the **Android M5** section for the full M5 channel surface.
 - EventChannel payload: `{state, grantExpiresAt, degraded}` broadcast from the
   service via LocalBroadcastManager.
 
@@ -203,12 +197,11 @@ sides, so they never double-escalate.
   `android/key.properties` when present, else falls back to debug signing so
   `flutter build apk` always works. `key.properties` / keystores are gitignored.
 
-### Deferred to M5
-- The full-screen overlay, AccessibilityService, per-app blocking, usage-access
-  reads, and the permission-onboarding UI. The seams (SYSTEM_ALERT_WINDOW perm,
-  the escalation no-op in the service, the `requestOverlay` / `requestUsageAccess`
-  / `allowApp` stubs) are left clean.
-- The `full` sideload flavor (broader-permission build) is a later milestone.
+### Deferred to M5 — now DONE
+- The full-screen overlay, optional AccessibilityService, per-app blocking,
+  usage-access reads, and the permission-onboarding UI all landed in M5 (see the
+  **Android M5** section). The `full` sideload flavor (broader-permission build)
+  is still a later milestone.
 
 ### Play declarations required (at submission time)
 - A specialUse FGS justification (the manifest `<property>` subtype string is
@@ -223,3 +216,116 @@ Runtime behavior cannot be tested in this environment. Deferred to on-device QA:
 alarm firing accuracy, boot recovery, Doze survival of `setAndAllowWhileIdle`,
 the FGS 10s `startForeground` window, notification "Turn off" action, and the
 EventChannel state mirroring.
+
+## Android M5 — per-app selective unlock + adjustable overlay + onboarding
+
+M5 adds the Play-compliant enforcement layer on top of the M4 backstop: a lock
+overlay over disallowed apps, a user-approved per-app unlock, and a permission
+onboarding flow. **The whole design keeps UsageStats as the primary
+foreground-app detector; the AccessibilityService is an optional, removable
+latency enhancement.**
+
+### Native (Kotlin)
+- `ForegroundAppWatcher` — **PRIMARY** detector. Polls
+  `UsageStatsManager.queryEvents` (~1s) for the current foreground package. Runs
+  ONLY while the guardian is actively enforcing (locked / active grant), never as
+  a standing loop. `hasUsageAccess()` gates it; degrades gracefully when not
+  granted.
+- `AllowListManager` — persisted, time-limited per-app allow-list
+  (`package → expiry`). Persists into the SAME `FlutterSharedPreferences` blob
+  (`flutter.app_allowlist`) and JSON shape as Dart's `AppAllowlist`. Own package
+  and the default launcher are ALWAYS allowed. `isAllowed` / `allow` /
+  `activeEntries` / `purgeExpired` / `nextExpiryMillis`.
+- `OverlayController` + `res/layout/overlay_lockdown.xml` +
+  `res/layout/overlay_banner.xml` — `TYPE_APPLICATION_OVERLAY` full-screen block
+  (with an "Open Sleep Time" button that brings `MainActivity` forward) and a
+  slim grant countdown banner. Holds a screen wake lock ONLY while an overlay is
+  visible. **Fallback:** if adding/showing the overlay fails (e.g.
+  `setHideOverlayWindows`, OEM refusal, or no permission) it brings
+  `MainActivity` to front instead, so the lock is never silently bypassed.
+- `SleepAccessibilityService` + `res/xml/accessibility_service_config.xml` —
+  OPTIONAL. `typeWindowStateChanged` only, 500ms debounce, observe-only,
+  `canRetrieveWindowContent=false`, **NOT `isAccessibilityTool`**. It only feeds
+  the observed package into the same (UsageStats-primary) evaluation path faster.
+  The evaluation logic does not depend on it; it works disabled or revoked.
+- `SleepGuardianService` — the M4 escalation seam is now filled. While locked and
+  NOT in safe mode it arms the watcher; for each foreground app it shows the full
+  block (disallowed) or the countdown banner (allowed app during an active
+  grant), re-blocking on expiry. Safe mode still escalates nothing.
+
+### Channel surface (M5 additions in `MainActivity`)
+- `requestOverlay` (`ACTION_MANAGE_OVERLAY_PERMISSION`),
+  `requestUsageAccess` (`ACTION_USAGE_ACCESS_SETTINGS`),
+  `requestAccessibility` (`ACTION_ACCESSIBILITY_SETTINGS`),
+  `allowApp({package,label,minutes})`,
+  `listInstalledApps` (`getInstalledApplications(0)`, launchable user apps,
+  **no `QUERY_ALL_PACKAGES`**), `deviceManufacturer`.
+- `getPermissionStatus` now reports real `overlay` / `usageAccess` /
+  `accessibility` booleans. `onResume` pushes a fresh status to Dart via
+  `onPermissionStatusChanged`.
+
+### Dart
+- `lib/ui/overlay/overlay_size.dart` — `OverlaySize {full, banner, mini}` +
+  pure `OverlaySizing.select(...)`.
+- `lib/ui/overlay/overlay_shell.dart` — reusable shell rendering lockdown content
+  at the chosen size; `lockdown_screen.dart` uses it for the granted view
+  (full-grant fold-to-corner mini + per-app grant view with the app name,
+  remaining time, and a "back to sleep early" action). Red is reserved for the
+  final 2-minute countdown only.
+- `lib/ui/overlay/guardian_copy.dart` — time-of-night warm copy table
+  (gentler near bedtime, firmer in the small hours).
+- `lib/ui/permissions_onboarding_screen.dart` — stepped flow: notifications →
+  overlay → usage-access (REQUIRED) → exact-alarm → battery (warn only) →
+  Accessibility (OPTIONAL, with the MANDATORY prominent-disclosure dialog before
+  the redirect). Hard gates (`PermissionGating.hardGates`): overlay + usage-access
+  + exact-alarm. Re-checks on resume. Best-effort OEM battery hints by
+  `Build.MANUFACTURER` (Samsung / Xiaomi / OnePlus), falling back to the generic
+  battery dialog. Reachable from Settings and shown as a first-run gate.
+- `lib/core/permission_gating.dart` — pure gating logic (hard gates, `canFinish`).
+- `lib/core/negotiable_apps.dart` — `NegotiableAppStore`: the user-approved set
+  of apps the guardian MAY unlock. `unlock_app` on Android is constrained to this
+  set (resolve by package or friendly label; unapproved → degrade to a normal
+  timed grant, never silently allow).
+- `lib/ui/allowlist_editor_screen.dart` — Settings editor for the approved set,
+  populated from `listInstalledApps`. Entry point added in `settings_screen.dart`;
+  the stale "device-admin and lock-task" copy was rewritten to the
+  overlay/usage-access framing.
+
+### How `unlock_app` is constrained
+The guardian tool can name any app, but on Android the unlock path
+(`_onUnlockAppAndroid` in `lockdown_screen.dart`) only proceeds if
+`NegotiableAppStore.resolve(identifier)` matches a user-approved app. Otherwise it
+degrades to a plain timed grant. The native `AllowListManager` is only ever told
+to allow a resolved, approved package.
+
+### Tests (no device)
+`test/overlay_size_test.dart`, `test/guardian_copy_test.dart`,
+`test/permission_gating_test.dart`, `test/negotiable_apps_test.dart` cover
+overlay-size selection, time-bucketing, onboarding hard-gate logic
+(incl. the "works with accessibility disabled" invariant), and approved-app
+persistence + label→package resolution. All existing tests stay green.
+
+### Play declarations (see docs/PLAY_SUBMISSION.md)
+specialUse FGS + demo; the Accessibility declaration (category Digital
+Wellbeing) + demo + that it is optional; the prominent-disclosure requirement;
+Data Safety (local app-usage data + chat messages sent to Anthropic/Gemini); the
+sensitive-permission table with justifications; explicitly NO `QUERY_ALL_PACKAGES`
+and `isAccessibilityTool` NOT set.
+
+### Unverified — pending device QA (M5)
+- Overlay actually drawing over a third-party app; the `setHideOverlayWindows`
+  fallback path; wake-lock acquire/release timing.
+- UsageStats foreground detection accuracy and the ~1s poll latency vs. the
+  accessibility fast-path.
+- The system permission redirects (overlay / usage-access / accessibility) and
+  the `onResume` status refresh round-trip.
+- OEM battery deep-link behavior on Samsung/Xiaomi/OnePlus.
+- AllowList expiry → re-block transition and the banner countdown.
+
+### Follow-ups for M6
+- A `full` sideload flavor with broader enforcement (the M4-noted broader-perms
+  build).
+- Native unit/instrumentation tests for `AllowListManager` ISO round-trip and the
+  `ForegroundAppWatcher` event parsing.
+- Tighten the overlay UX (animations, accessibility of the overlay itself) and
+  consider a per-grant "extend" affordance from the banner.

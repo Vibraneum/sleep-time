@@ -50,8 +50,32 @@ class AndroidGuardianEvent {
       'grantExpiresAt: $grantExpiresAt, degraded: $degraded)';
 }
 
+/// A single installed app the user can choose to put on the allow-list.
+@immutable
+class AndroidInstalledApp {
+  final String package;
+  final String label;
+
+  const AndroidInstalledApp({required this.package, required this.label});
+
+  factory AndroidInstalledApp.fromMap(Map<dynamic, dynamic> map) =>
+      AndroidInstalledApp(
+        package: (map['package'] as String?) ?? '',
+        label: (map['label'] as String?) ?? (map['package'] as String?) ?? '',
+      );
+
+  @override
+  bool operator ==(Object other) =>
+      other is AndroidInstalledApp &&
+      other.package == package &&
+      other.label == label;
+
+  @override
+  int get hashCode => Object.hash(package, label);
+}
+
 /// Native runtime permission snapshot for the Android guardian. Overlay /
-/// accessibility / usage-access are M5 placeholders and report `false` here.
+/// accessibility / usage-access are real signals as of M5.
 @immutable
 class AndroidPermissionStatus {
   final bool notifications;
@@ -190,6 +214,94 @@ class AndroidLockdown {
   /// Open the system "ignore battery optimizations" dialog.
   static Future<void> requestBatteryExemption() async =>
       _invokeVoid('requestBatteryExemption');
+
+  /// Open the system "draw over other apps" (overlay) settings.
+  static Future<void> requestOverlay() async => _invokeVoid('requestOverlay');
+
+  /// Open the system Usage-Access settings (PRIMARY foreground-app detector).
+  static Future<void> requestUsageAccess() async =>
+      _invokeVoid('requestUsageAccess');
+
+  /// Open the system Accessibility settings (OPTIONAL latency enhancement).
+  /// Callers MUST show the prominent-disclosure dialog before invoking this.
+  static Future<void> requestAccessibility() async =>
+      _invokeVoid('requestAccessibility');
+
+  /// Add [package] to the native time-limited allow-list for [minutes].
+  /// Returns true when the native side accepted it.
+  static Future<bool> allowApp({
+    required String package,
+    required int minutes,
+    String label = '',
+  }) async {
+    if (!Platform.isAndroid) return false;
+    try {
+      final ok = await _channel.invokeMethod('allowApp', {
+        'package': package,
+        'label': label,
+        'minutes': minutes,
+      });
+      return ok == true;
+    } on MissingPluginException {
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// The device manufacturer (`Build.MANUFACTURER`), lowercased, for best-effort
+  /// OEM battery deep-link hints. Empty off-Android / when unavailable.
+  static Future<String> deviceManufacturer() async {
+    if (!Platform.isAndroid) return '';
+    try {
+      final m = await _channel.invokeMethod('deviceManufacturer');
+      return (m as String?)?.toLowerCase() ?? '';
+    } on MissingPluginException {
+      return '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  /// The launchable installed-app catalog (no QUERY_ALL_PACKAGES). Empty
+  /// off-Android or when the plugin is missing.
+  static Future<List<AndroidInstalledApp>> listInstalledApps() async {
+    if (!Platform.isAndroid) return const [];
+    try {
+      final raw = await _channel.invokeMethod('listInstalledApps');
+      if (raw is List) {
+        return raw
+            .whereType<Map>()
+            .map(AndroidInstalledApp.fromMap)
+            .where((a) => a.package.isNotEmpty)
+            .toList(growable: false);
+      }
+      return const [];
+    } on MissingPluginException {
+      return const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// Register a callback fired when native pushes a fresh permission snapshot
+  /// (e.g. after the user returns from a system settings screen via onResume).
+  static void setPermissionStatusListener(
+    void Function(AndroidPermissionStatus status)? listener,
+  ) {
+    if (!Platform.isAndroid) return;
+    if (listener == null) {
+      _channel.setMethodCallHandler(null);
+      return;
+    }
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'onPermissionStatusChanged') {
+        final args = call.arguments;
+        if (args is Map) listener(AndroidPermissionStatus.fromMap(args));
+      }
+      return null;
+    });
+  }
 
   static Future<void> _invokeVoid(String method) async {
     if (!Platform.isAndroid) return;

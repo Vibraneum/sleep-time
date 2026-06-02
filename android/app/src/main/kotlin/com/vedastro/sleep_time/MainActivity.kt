@@ -37,14 +37,16 @@ class MainActivity : FlutterActivity() {
 
     private var eventSink: EventChannel.EventSink? = null
     private var stateReceiver: BroadcastReceiver? = null
+    private var methodChannel: MethodChannel? = null
 
     private val notificationsRequestCode = 9001
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
+        methodChannel = channel
+        channel.setMethodCallHandler { call, result ->
                 when (call.method) {
                     "ping" -> result.success(true)
 
@@ -82,10 +84,39 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
 
-                    // M5 fills these in (overlay / usage-access / per-app allow).
-                    "requestOverlay" -> result.success(false)
-                    "requestUsageAccess" -> result.success(false)
-                    "allowApp" -> result.success(false)
+                    "requestOverlay" -> {
+                        requestOverlay()
+                        result.success(true)
+                    }
+
+                    "requestUsageAccess" -> {
+                        requestUsageAccess()
+                        result.success(true)
+                    }
+
+                    "requestAccessibility" -> {
+                        requestAccessibility()
+                        result.success(true)
+                    }
+
+                    "allowApp" -> {
+                        val pkg = call.argument<String>("package")
+                        val label = call.argument<String>("label") ?: pkg ?: ""
+                        val minutes = call.argument<Int>("minutes") ?: 0
+                        if (pkg.isNullOrEmpty()) {
+                            result.success(false)
+                        } else {
+                            AllowListManager.allow(this, pkg, label, minutes)
+                            // Nudge the running guardian to re-evaluate now.
+                            SleepGuardianService.evaluate(this, null)
+                            result.success(true)
+                        }
+                    }
+
+                    "listInstalledApps" -> result.success(listInstalledApps())
+
+                    "deviceManufacturer" ->
+                        result.success(Build.MANUFACTURER ?: "")
 
                     else -> result.notImplemented()
                 }
@@ -137,7 +168,21 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         unregisterStateReceiver()
+        methodChannel = null
         super.onDestroy()
+    }
+
+    /**
+     * Permission grants happen in another app (Settings), so the user returns to
+     * us via onResume. Re-read the live status and push it to Dart so the
+     * onboarding / settings UI updates without the user having to pull-to-refresh.
+     */
+    override fun onResume() {
+        super.onResume()
+        try {
+            methodChannel?.invokeMethod("onPermissionStatusChanged", permissionStatus())
+        } catch (_: Exception) {
+        }
     }
 
     private fun permissionStatus(): Map<String, Boolean> {
@@ -153,15 +198,42 @@ class MainActivity : FlutterActivity() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
         val batteryExemption = powerManager.isIgnoringBatteryOptimizations(packageName)
 
+        val overlay = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            Settings.canDrawOverlays(this)
+        } else {
+            true
+        }
+
+        val usageAccess = ForegroundAppWatcher.hasUsageAccess(this)
+        val accessibility = isAccessibilityServiceEnabled()
+
         return mapOf(
             "notifications" to notifications,
             "exactAlarm" to exactAlarm,
             "batteryExemption" to batteryExemption,
-            // M5 placeholders.
-            "overlay" to false,
-            "accessibility" to false,
-            "usageAccess" to false,
+            "overlay" to overlay,
+            "accessibility" to accessibility,
+            "usageAccess" to usageAccess,
         )
+    }
+
+    /**
+     * Whether the user has enabled our OPTIONAL accessibility helper. Read from
+     * the secure setting list rather than relying on a live service instance, so
+     * it is accurate even if the service was just revoked by Advanced Protection.
+     */
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        return try {
+            val flat = Settings.Secure.getString(
+                contentResolver,
+                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+            ) ?: return false
+            val component = "$packageName/$packageName.SleepAccessibilityService"
+            val componentShort = "$packageName/.SleepAccessibilityService"
+            flat.split(':').any { it.equals(component, true) || it.equals(componentShort, true) }
+        } catch (_: Exception) {
+            false
+        }
     }
 
     private fun requestExactAlarm() {
@@ -196,6 +268,68 @@ class MainActivity : FlutterActivity() {
             startActivity(intent)
         } catch (_: Exception) {
             openAppSettings()
+        }
+    }
+
+    private fun requestOverlay() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return
+        val intent = Intent(
+            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+            Uri.parse("package:$packageName"),
+        ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            openAppSettings()
+        }
+    }
+
+    private fun requestUsageAccess() {
+        val intent = Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)
+            .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            openAppSettings()
+        }
+    }
+
+    private fun requestAccessibility() {
+        val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            .apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            openAppSettings()
+        }
+    }
+
+    /**
+     * The user-app catalog for the allow-list editor. Uses
+     * getInstalledApplications(0) — NO QUERY_ALL_PACKAGES — and prefers
+     * launchable, non-system apps. Returns `[{package, label}]`.
+     */
+    private fun listInstalledApps(): List<Map<String, String>> {
+        return try {
+            val pm = packageManager
+            val apps = pm.getInstalledApplications(0)
+            apps.asSequence()
+                .filter { it.packageName != packageName }
+                .filter {
+                    // Launchable apps the user could actually open. Non-launchable
+                    // system services are noise for an allow-list.
+                    pm.getLaunchIntentForPackage(it.packageName) != null
+                }
+                .map {
+                    mapOf(
+                        "package" to it.packageName,
+                        "label" to (pm.getApplicationLabel(it)?.toString() ?: it.packageName),
+                    )
+                }
+                .sortedBy { it["label"]?.lowercase() }
+                .toList()
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 

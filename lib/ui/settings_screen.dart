@@ -7,6 +7,8 @@ import '../core/config.dart';
 import '../core/schedule.dart';
 import '../core/schedule_store.dart';
 import '../platform/windows_lockdown.dart';
+import 'allowlist_editor_screen.dart';
+import 'permissions_onboarding_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -377,7 +379,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _textField('Poke API Key', _pokeKeyController, obscure: true),
               const SizedBox(height: 10),
               const Text(
-                'Windows enforcement is best-effort: always-on-top, fullscreen, prevent-close, and taskbar hiding. Android uses device-admin and lock-task hooks where available.',
+                'Windows enforcement is best-effort: always-on-top, fullscreen, prevent-close, and taskbar hiding. Android shows a Play-compliant lock overlay over blocked apps, using usage access to see which app is in front (with an optional accessibility helper for faster reactions). It never uses device-admin or kiosk lock-task.',
                 style: TextStyle(
                   fontSize: 13,
                   color: Color(0xFF8E8EA0),
@@ -385,6 +387,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ]),
+            if (Platform.isAndroid) ...[
+              const SizedBox(height: 16),
+              _card([
+                _sectionTitle('Android'),
+                const SizedBox(height: 10),
+                const Text(
+                  'Manage the permissions the background guardian needs, and '
+                  'choose which apps the guardian is allowed to unlock during '
+                  'lockdown.',
+                  style: TextStyle(
+                      fontSize: 13, color: Color(0xFF8E8EA0), height: 1.5),
+                ),
+                const SizedBox(height: 12),
+                _navTile(
+                  Icons.shield_outlined,
+                  'Permissions',
+                  'Notifications, overlay, usage access, alarms, battery',
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => PermissionsOnboardingScreen(
+                        onComplete: () => Navigator.of(context).pop(),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _navTile(
+                  Icons.apps_rounded,
+                  'Apps the guardian can unlock',
+                  'Opt in the apps the guardian may free during lockdown',
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const AllowlistEditorScreen(),
+                    ),
+                  ),
+                ),
+              ]),
+            ],
             const SizedBox(height: 16),
             _card([
               _sectionTitle('Guardian policy'),
@@ -447,6 +489,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: children,
+      ),
+    );
+  }
+
+  Widget _navTile(
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback onTap,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: const Color(0xFF5B5FEF).withAlpha(24),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: const Color(0xFF5B5FEF), size: 22),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: Color(0xFF1A1A2E))),
+                  Text(subtitle,
+                      style: const TextStyle(
+                          fontSize: 12, color: Color(0xFF8E8EA0))),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded, color: Color(0xFF8E8EA0)),
+          ],
+        ),
       ),
     );
   }

@@ -1,4 +1,5 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14+ requires a typed foreground service permission. The
@@ -25,6 +26,16 @@
          bedtime alarms survive overnight. Requested at runtime via the system
          dialog; never auto-applied. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- PRIMARY foreground-app detector. UsageStatsManager is the source of
+         truth for which app is in front while locked; the optional
+         AccessibilityService below only feeds it faster. This is a protected
+         permission granted by the user from the system Usage-Access screen
+         (never auto-granted), so we annotate it for lint. We deliberately do
+         NOT add QUERY_ALL_PACKAGES — the app catalog uses
+         getInstalledApplications(0), which needs no package-visibility grant. -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
 
     <application
         android:label="sleep time"
@@ -61,6 +72,26 @@
                 <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- OPTIONAL latency enhancement only. The app is fully functional with
+             this service disabled (UsageStats is the primary detector). It is an
+             observe-only Digital Wellbeing helper: typeWindowStateChanged only,
+             no input injection, NOT flagged isAccessibilityTool. Android 17
+             Advanced Protection can silently revoke it; the guardian must not
+             depend on it. A prominent disclosure dialog is shown in-app BEFORE
+             the user is ever sent to the Accessibility settings. -->
+        <service
+            android:name=".SleepAccessibilityService"
+            android:exported="false"
+            android:label="@string/accessibility_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
         <activity
             android:name=".MainActivity"

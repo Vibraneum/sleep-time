@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  OPTIONAL latency enhancement for the bedtime guardian.
+
+  Play / policy notes:
+  - Observe-only: we declare ONLY typeWindowStateChanged (foreground-app
+    changes). No input injection, no content reading, no gesture dispatch.
+  - canRetrieveWindowContent is false: we never read screen content.
+  - notificationTimeout 500ms debounces window-change spam.
+  - We deliberately do NOT set android:isAccessibilityTool="true". This is not a
+    tool for users with disabilities; it is a Digital Wellbeing helper, and
+    mislabelling it would be a policy violation. Android 17 Advanced Protection
+    may silently revoke non-tool services — the guardian treats this service as
+    purely optional and falls back to UsageStats polling.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/accessibility_service_description"
+    android:notificationTimeout="500" />

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Shown on the system Accessibility list. Framed honestly as a Digital
+         Wellbeing / bedtime helper — never as "disability assistance". -->
+    <string name="accessibility_service_label">Sleep Time bedtime helper</string>
+    <string name="accessibility_service_description">Optional. Lets Sleep Time notice which app is in front a little faster while your bedtime lock is active, so the lock screen appears more promptly. Sleep Time works fully without this — it normally uses usage access instead. This helper only observes window changes; it never reads your screen content, taps, or types for you.</string>
+</resources>
