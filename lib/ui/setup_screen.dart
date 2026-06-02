@@ -17,7 +17,7 @@ class _SetupScreenState extends State<SetupScreen> {
   final _anthropicKeyController = TextEditingController();
   bool _loading = false;
   String? _error;
-  AiProvider _provider = AiProvider.gemini;
+  AiProvider _provider = AiProvider.anthropic;
   bool _useBringYourOwnKey = true;
 
   bool get _canContinue {

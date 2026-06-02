@@ -44,7 +44,7 @@ Future<void> _loadConfig() async {
       const String.fromEnvironment('POKE_API_KEY', defaultValue: '');
   AppConfig.useBringYourOwnKey = prefs.getBool('use_byok') ?? true;
 
-  AppConfig.aiProvider = AiProvider.gemini;
+  AppConfig.aiProvider = AiProvider.anthropic;
   final providerName = prefs.getString('ai_provider');
   for (final provider in AiProvider.values) {
     if (provider.name == providerName) {
@@ -55,8 +55,14 @@ Future<void> _loadConfig() async {
 
   AppConfig.geminiModel =
       prefs.getString('gemini_model') ?? 'gemini-2.5-flash';
-  AppConfig.anthropicModel =
-      prefs.getString('anthropic_model') ?? 'claude-sonnet-4-5';
+  // Upgrade a stale saved Anthropic model (e.g. an old claude-3-5-sonnet) to the
+  // current default, and persist the upgrade so it sticks.
+  final resolvedAnthropicModel =
+      AppConfig.resolveAnthropicModel(prefs.getString('anthropic_model'));
+  AppConfig.anthropicModel = resolvedAnthropicModel;
+  if (prefs.getString('anthropic_model') != resolvedAnthropicModel) {
+    await prefs.setString('anthropic_model', resolvedAnthropicModel);
+  }
 
   AppConfig.safeWord = prefs.getString('safe_word') ?? 'dontdie';
 

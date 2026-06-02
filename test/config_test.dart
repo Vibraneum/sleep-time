@@ -43,4 +43,30 @@ void main() {
       expect(AppConfig.simulateLockdown, isTrue);
     });
   });
+
+  group('AppConfig provider/model defaults', () {
+    test('defaults to Anthropic with the latest Sonnet', () {
+      // The guardian relies on real tool-calling (Anthropic only), so Anthropic
+      // is the default provider and the default model is the current Sonnet.
+      expect(AppConfig.defaultAnthropicModel, 'claude-sonnet-4-6');
+    });
+
+    test('resolveAnthropicModel upgrades stale defaults but keeps user choices',
+        () {
+      // Empty / unset -> default.
+      expect(AppConfig.resolveAnthropicModel(null),
+          AppConfig.defaultAnthropicModel);
+      expect(AppConfig.resolveAnthropicModel('  '),
+          AppConfig.defaultAnthropicModel);
+      // Every superseded default (incl. the old claude-3-5-sonnet) -> default.
+      for (final legacy in AppConfig.legacyAnthropicModels) {
+        expect(AppConfig.resolveAnthropicModel(legacy),
+            AppConfig.defaultAnthropicModel,
+            reason: '$legacy should upgrade');
+      }
+      // A deliberate user-entered model is preserved verbatim.
+      expect(AppConfig.resolveAnthropicModel('claude-opus-4-8'),
+          'claude-opus-4-8');
+    });
+  });
 }

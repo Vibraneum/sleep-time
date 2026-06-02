@@ -133,7 +133,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ? 'gemini-2.5-flash'
         : _geminiModelController.text.trim();
     AppConfig.anthropicModel = _anthropicModelController.text.trim().isEmpty
-        ? 'claude-sonnet-4-5'
+        ? AppConfig.defaultAnthropicModel
         : _anthropicModelController.text.trim();
     // Schedule mirrored into ScheduleStore above via apply().
     AppConfig.safeWord = _safeWordController.text.trim();

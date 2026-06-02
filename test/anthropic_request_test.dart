@@ -24,7 +24,8 @@ void main() {
       expect(body['tool_choice'], {'type': 'any'});
       expect(body['disable_parallel_tool_use'], isTrue);
       expect(body['model'], AppConfig.anthropicModel);
-      expect(body['model'], 'claude-sonnet-4-5');
+      expect(body['model'], AppConfig.defaultAnthropicModel);
+      expect(AppConfig.defaultAnthropicModel, 'claude-sonnet-4-6');
     });
 
     test('cache_control on the LAST system block and the LAST tool', () {

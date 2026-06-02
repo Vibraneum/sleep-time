@@ -10,11 +10,44 @@ class AppConfig {
   static String geminiApiKey = '';
   static String anthropicApiKey = '';
   static String pokeApiKey = '';
-  static AiProvider aiProvider = AiProvider.gemini;
+
+  /// Anthropic is the default provider: the guardian is built around real
+  /// tool-calling, which only the Anthropic path supports (Gemini is a
+  /// quarantined text-parsing fallback).
+  static AiProvider aiProvider = AiProvider.anthropic;
   static bool useBringYourOwnKey = false;
   static String geminiModel = 'gemini-2.5-flash';
-  static String anthropicModel = 'claude-sonnet-4-5';
+
+  /// The latest Sonnet. Defined once here so the default can't drift across the
+  /// config, the loader, and the settings screen (which is how an old
+  /// `claude-3-5-sonnet` string lingered).
+  static const String defaultAnthropicModel = 'claude-sonnet-4-6';
+
+  /// Superseded Anthropic model ids that were shipped as defaults at some point.
+  /// A saved value matching one of these is silently upgraded to
+  /// [defaultAnthropicModel] on load (see [resolveAnthropicModel]); a value the
+  /// user typed themselves is left untouched.
+  static const Set<String> legacyAnthropicModels = {
+    'claude-3-5-sonnet-latest',
+    'claude-3-5-sonnet-20241022',
+    'claude-3-5-sonnet',
+    'claude-haiku-4-5-20251001',
+    'claude-sonnet-4-5',
+  };
+
+  static String anthropicModel = defaultAnthropicModel;
   static String safeWord = 'dontdie';
+
+  /// Resolve the effective Anthropic model from a persisted value: empty or a
+  /// known-stale default upgrades to [defaultAnthropicModel]; anything else
+  /// (a deliberate user choice) is kept as-is.
+  static String resolveAnthropicModel(String? saved) {
+    final value = saved?.trim() ?? '';
+    if (value.isEmpty || legacyAnthropicModels.contains(value)) {
+      return defaultAnthropicModel;
+    }
+    return value;
+  }
 
   /// Off by default. The previous default of `true` silently registered the
   /// app to launch with Windows the first time it ran — invasive for anyone
