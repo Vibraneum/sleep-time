@@ -11,7 +11,7 @@ A bedtime enforcer for Windows. Locks your screen at a set time. An AI guardian 
 1. Go to [Releases](https://github.com/Vibraneum/sleep-time/releases/latest)
 2. Download `sleep-time-windows-setup-vX.X.X.exe` (installer) or the `.zip` (portable)
 3. Run the installer — Windows may show a SmartScreen warning since the app is unsigned; click **More info → Run anyway**
-4. On first launch, enter a [Gemini API key](https://aistudio.google.com/apikey) (free tier works)
+4. On first launch, open **Settings → AI Provider** and enter an API key for your chosen provider ([Anthropic](https://console.anthropic.com) recommended; [Gemini](https://aistudio.google.com/apikey) also supported)
 5. Set your sleep schedule in Settings and leave the app running
 
 That's it. The app sits in the background and locks the screen at your configured time.
@@ -35,13 +35,19 @@ When locked, you can tap **Negotiate** to chat with the AI guardian. It has full
 
 The app supports two providers. Pick one:
 
-### Gemini (default)
+### Anthropic Claude (recommended)
 
-Get a free key at [aistudio.google.com](https://aistudio.google.com/apikey). Enter it in Settings → AI Provider.
+The guardian is built around real **tool-calling** — Claude (Sonnet by default)
+makes exactly one structured decision per turn (grant / deny / unlock a specific
+app / adjust the schedule / end the session), so it's decisive and cheap. Get a
+key at [console.anthropic.com](https://console.anthropic.com) and select Anthropic
+in Settings → AI Provider.
 
-### Anthropic Claude
+### Gemini (fallback)
 
-Get a key at [console.anthropic.com](https://console.anthropic.com). Switch providers in Settings → AI Provider.
+Get a free key at [aistudio.google.com](https://aistudio.google.com/apikey). Gemini
+runs as a text-parsing fallback (no typed tool use), so the guardian is a little
+less reliable than on Claude. Enter the key in Settings → AI Provider.
 
 ---
 
@@ -66,8 +72,8 @@ The app will open without any API key — visit Settings to add one.
 
 > **Safe by default in dev.** Debug builds run with **safe mode** on, so
 > launching the app on your laptop won't fullscreen the screen, register
-> auto-startup, or spawn the focus-stealing PowerShell guardian. The lockdown
-> UI still flows end to end — only the platform side effects are stubbed.
+> auto-startup, or spawn the recovery watchdog. The lockdown UI still flows end
+> to end — only the platform side effects are stubbed.
 >
 > To explicitly force one or the other:
 >
@@ -115,13 +121,19 @@ The workflow will analyze, test, build the Windows portable zip and installer, t
 ## Windows enforcement
 
 What happens during lockdown:
-- fullscreen, always-on-top window
-- prevent-close enabled
-- refocus timer reclaims focus every 500 ms
-- companion PowerShell process uses Win32 APIs to steal focus every 150 ms
+- fullscreen, always-on-top window with prevent-close
+- **event-driven** focus reclaim — a `SetWinEventHook` on the foreground event
+  snaps focus back when another window tries to take over (no busy polling loop,
+  so idle CPU/battery cost is near zero)
+- a sibling **watchdog process** (`sleep_time_watchdog.exe`) relaunches the app if
+  it is killed while locked
+- **per-app selective unlock** — the guardian can free a specific app (e.g. your
+  browser) for N minutes, shrinking to a corner countdown HUD while everything
+  else stays blocked
 - on app startup, any leftover lockdown state from a previous crash is cleaned up automatically
 
-The guardian AI can also **minimize**, **close**, or **fully unlock** the app — users must negotiate for these actions.
+The guardian AI can also **minimize**, **close**, **adjust your schedule** (within
+anti-manipulation guardrails), or **fully unlock** the app — all via negotiation.
 
 What it **cannot** stop:
 - Ctrl+Alt+Del (Secure Attention Sequence — reserved by the OS)
@@ -142,33 +154,52 @@ See `docs/WINDOWS_THREAT_MODEL.md` for the full threat model.
 | `CODE_OF_CONDUCT.md` | Community standards |
 | `docs/WINDOWS_THREAT_MODEL.md` | Windows enforcement limits |
 | `docs/WINDOWS_PACKAGING_AND_SIGNING.md` | Signing and distribution notes |
+| `docs/WINDOWS_RELEASE.md` | Windows build → installer → signing → QA pipeline |
+| `docs/QA_STRATEGY.md` | Test pyramid, device matrices, safe-test discipline |
+| `docs/PLAY_SUBMISSION.md` | Google Play declarations and Data Safety notes |
 
 ---
 
 ## Mobile (Android)
 
-Android is supported as a build target with **best-effort** kiosk-mode lockdown via Device Admin + lock-task. Real-world enforcement on Android is intrinsically more limited than Windows because the OS does not let user apps stop the user from killing them.
+Android is built to be **Google Play–distributable** — the old Device Admin +
+kiosk (lock-task) approach was removed (it requires Device Owner provisioning and
+is a guaranteed Play rejection). Instead, enforcement is a policy-compliant stack:
 
 ```bash
 # Run on a connected Android device (USB debugging enabled)
 flutter run -d android --dart-define=SIMULATE_LOCKDOWN=true
 
 # Build a debug APK to side-load
-flutter build apk --debug --dart-define=SIMULATE_LOCKDOWN=true
+flutter build apk --debug
 ```
 
-What works today on Android:
+How it works on Android:
 
-- Device Admin permission request (one-time setup)
-- `lockNow()` to immediately lock the screen
-- `startLockTask()` for screen-pinning kiosk mode
-- Manual `deactivate` / `grantExtension` flows back through the same channel
+- a **specialUse foreground service** keeps the guardian alive in the background,
+  driven by **exact alarms** (`AlarmManager`, guarded by `canScheduleExactAlarms()`
+  with a graceful inexact fallback) — it survives backgrounding and eviction
+- **WorkManager boot recovery** re-arms the schedule after a reboot (it does not
+  illegally start a specialUse FGS from `BOOT_COMPLETED`)
+- foreground-app detection via **UsageStats** (primary) with an **optional**
+  AccessibilityService as a latency boost — the app is fully functional without
+  accessibility (important for Android 17 Advanced Protection users)
+- a `SYSTEM_ALERT_WINDOW` **overlay** blocks non-allowed apps during lockdown, with
+  a corner countdown banner during a grant and a fallback to bringing the app
+  forward when the overlay is refused
+- **per-app selective unlock**: the guardian frees only apps you pre-approved in
+  the allow-list editor, for a limited time
+- a gated **permission onboarding** flow (notifications, overlay, usage-access,
+  exact-alarm, battery) with a **prominent disclosure** shown before any
+  Accessibility redirect
 
-Known gaps (tracked, not yet implemented):
+See [`docs/PLAY_SUBMISSION.md`](docs/PLAY_SUBMISSION.md) for the Play Console
+declarations (specialUse FGS justification, optional-Accessibility disclosure,
+Data Safety). Real-device enforcement QA is still pending.
 
-- No persistent foreground service yet, so the scheduler stops firing if the OS evicts the app from memory. Lockdown only triggers while the app is in the foreground or recently backgrounded.
-- No exact-alarm-based scheduler. The manifest now declares `SCHEDULE_EXACT_ALARM` / `USE_EXACT_ALARM` so the future implementation can call `AlarmManager.setExactAndAllowWhileIdle` without a manifest churn.
-- Notifications channel for Android 13+ runtime permission is requested via the manifest declaration (`POST_NOTIFICATIONS`); the in-app prompt and notification code is on the roadmap.
+> A broader-permission **sideload (`full`) build** — for users who want stronger
+> grip than Play policy allows — is planned as a later flavor behind the existing
+> `Capabilities` seam.
 
 iOS is **not** currently supported — there is no `ios/` runner directory yet. Apple's app sandbox makes a true bedtime lock impossible without MDM / Screen Time API entitlements; a useful iOS port would expose Screen Time API integration rather than try to emulate the Windows lockdown model.
 

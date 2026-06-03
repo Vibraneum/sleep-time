@@ -4,7 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/config.dart';
+import '../core/schedule.dart';
+import '../core/schedule_store.dart';
+import '../core/secure_key_store.dart';
 import '../platform/windows_lockdown.dart';
+import 'allowlist_editor_screen.dart';
+import 'permissions_onboarding_screen.dart';
 
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
@@ -21,15 +26,22 @@ class _SettingsScreenState extends State<SettingsScreen> {
   final _anthropicModelController = TextEditingController();
   final _safeWordController = TextEditingController();
 
+  final _secureKeyStore = SecureKeyStore();
+
   late AiProvider _provider;
   late bool _useBringYourOwnKey;
   late bool _runAtStartup;
   late bool _simulateLockdown;
+  late bool _adaptiveThinking;
   late TimeOfDay _wakeUpTime;
   late TimeOfDay _windDownTime;
   late TimeOfDay _lockdownTime;
   late TimeOfDay _unlockTime;
   bool _saved = false;
+
+  /// Inline validation errors for the schedule, surfaced as red helper text
+  /// under the Schedule card. Populated on a blocked save.
+  List<String> _scheduleErrors = const [];
 
   @override
   void initState() {
@@ -38,6 +50,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _useBringYourOwnKey = AppConfig.useBringYourOwnKey;
     _runAtStartup = AppConfig.runAtStartup;
     _simulateLockdown = AppConfig.simulateLockdown;
+    _adaptiveThinking = AppConfig.adaptiveThinking;
     _wakeUpTime =
         TimeOfDay(hour: AppConfig.wakeUpHour, minute: AppConfig.wakeUpMinute);
     _windDownTime = TimeOfDay(
@@ -60,32 +73,70 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _save() async {
+    // Build + validate the proposed schedule first; block the save (with inline
+    // red helper text) if it would be rejected by SleepSchedule.validate so we
+    // never persist an invalid schedule.
+    final proposed = SleepSchedule(
+      wakeUp: ScheduleTime(_wakeUpTime.hour, _wakeUpTime.minute),
+      windDown: ScheduleTime(_windDownTime.hour, _windDownTime.minute),
+      lockdown: ScheduleTime(_lockdownTime.hour, _lockdownTime.minute),
+      unlock: ScheduleTime(_unlockTime.hour, _unlockTime.minute),
+    );
+    final validation = proposed.validate();
+    if (!validation.ok) {
+      setState(() => _scheduleErrors = validation.violations);
+      return;
+    }
+
+    // Human escape hatch: moving the unlock EARLIER while we're inside the
+    // lockdown window would end the lock sooner than promised. Humans are
+    // allowed to do this (the AI is not), but confirm it first. We use
+    // AppConfig.isLockdownTime as the "currently locked" signal because the
+    // settings screen has no scheduler reference; this also covers the granted
+    // sub-state, which still falls inside the lockdown window.
+    final currentUnlockMin = AppConfig.unlockHour * 60 + AppConfig.unlockMinute;
+    final newUnlockMin = _unlockTime.hour * 60 + _unlockTime.minute;
+    if (AppConfig.isLockdownTime(DateTime.now()) &&
+        newUnlockMin < currentUnlockMin) {
+      final confirmed = await _confirmEarlierUnlock();
+      if (confirmed != true) return;
+    }
+
+    setState(() => _scheduleErrors = const []);
+
     final prefs = await SharedPreferences.getInstance();
 
     await prefs.setString('ai_provider', _provider.name);
     await prefs.setBool('use_byok', _useBringYourOwnKey);
-    await prefs.setString('gemini_api_key', _geminiKeyController.text.trim());
-    await prefs.setString(
-      'anthropic_api_key',
+    // API keys are written ONLY to encrypted-at-rest secure storage, never to
+    // plaintext SharedPreferences.
+    await _secureKeyStore.write(
+      SecureKeyStore.geminiApiKey,
+      _geminiKeyController.text.trim(),
+    );
+    await _secureKeyStore.write(
+      SecureKeyStore.anthropicApiKey,
       _anthropicKeyController.text.trim(),
     );
-    await prefs.setString('poke_api_key', _pokeKeyController.text.trim());
+    await _secureKeyStore.write(
+      SecureKeyStore.pokeApiKey,
+      _pokeKeyController.text.trim(),
+    );
     await prefs.setString('gemini_model', _geminiModelController.text.trim());
     await prefs.setString(
       'anthropic_model',
       _anthropicModelController.text.trim(),
     );
-    await prefs.setInt('wakeup_hour', _wakeUpTime.hour);
-    await prefs.setInt('wakeup_minute', _wakeUpTime.minute);
-    await prefs.setInt('winddown_hour', _windDownTime.hour);
-    await prefs.setInt('winddown_minute', _windDownTime.minute);
-    await prefs.setInt('lockdown_hour', _lockdownTime.hour);
-    await prefs.setInt('lockdown_minute', _lockdownTime.minute);
-    await prefs.setInt('unlock_hour', _unlockTime.hour);
-    await prefs.setInt('unlock_minute', _unlockTime.minute);
+    // Schedule writes funnel through ScheduleStore so the change persists,
+    // validates, audits, and notifies live listeners. Already validated above.
+    ScheduleStore.instance.apply(
+      proposed,
+      source: ScheduleSource.userSettings,
+    );
     await prefs.setString('safe_word', _safeWordController.text.trim());
     await prefs.setBool('run_at_startup', _runAtStartup);
     await prefs.setBool('simulate_lockdown', _simulateLockdown);
+    await prefs.setBool('adaptive_thinking', _adaptiveThinking);
 
     AppConfig.aiProvider = _provider;
     AppConfig.useBringYourOwnKey = _useBringYourOwnKey;
@@ -96,19 +147,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ? 'gemini-2.5-flash'
         : _geminiModelController.text.trim();
     AppConfig.anthropicModel = _anthropicModelController.text.trim().isEmpty
-        ? 'claude-3-5-sonnet-latest'
+        ? AppConfig.defaultAnthropicModel
         : _anthropicModelController.text.trim();
-    AppConfig.wakeUpHour = _wakeUpTime.hour;
-    AppConfig.wakeUpMinute = _wakeUpTime.minute;
-    AppConfig.windDownHour = _windDownTime.hour;
-    AppConfig.windDownMinute = _windDownTime.minute;
-    AppConfig.lockdownHour = _lockdownTime.hour;
-    AppConfig.lockdownMinute = _lockdownTime.minute;
-    AppConfig.unlockHour = _unlockTime.hour;
-    AppConfig.unlockMinute = _unlockTime.minute;
+    // Schedule mirrored into ScheduleStore above via apply().
     AppConfig.safeWord = _safeWordController.text.trim();
     AppConfig.runAtStartup = _runAtStartup;
     AppConfig.simulateLockdown = _simulateLockdown;
+    AppConfig.adaptiveThinking = _adaptiveThinking;
     if (Platform.isWindows) {
       if (_runAtStartup && !_simulateLockdown) {
         await WindowsLockdown.registerStartup();
@@ -122,6 +167,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _saved = false);
     });
+  }
+
+  Future<bool?> _confirmEarlierUnlock() {
+    return showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.white,
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+        ),
+        title: const Text(
+          'End lockdown earlier?',
+          style: TextStyle(
+            fontSize: 18,
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF1A1A2E),
+          ),
+        ),
+        content: const Text(
+          "You're currently in a lockdown window and moving the unlock time "
+          'earlier. This will let you out sooner than the schedule promised. '
+          'Continue?',
+          style: TextStyle(fontSize: 14, color: Color(0xFF8E8EA0), height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text(
+              'Cancel',
+              style: TextStyle(color: Color(0xFF8E8EA0)),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text(
+              'Unlock earlier',
+              style: TextStyle(
+                color: Color(0xFF5B5FEF),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _pickTime(
@@ -195,39 +285,68 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   if (value != null) setState(() => _provider = value);
                 },
               ),
-              const SizedBox(height: 12),
-              SwitchListTile.adaptive(
-                value: _useBringYourOwnKey,
-                contentPadding: EdgeInsets.zero,
-                title: const Text('Use my own Gemini key'),
-                subtitle: Text(
-                  usingConcierge
-                      ? hasConciergeKey
-                          ? 'Using the built-in Concierge Gemini key by default.'
-                          : 'No Concierge Gemini key is bundled in this build.'
-                      : 'Users can bring their own Gemini key.',
+              const SizedBox(height: 6),
+              Text(
+                _provider == AiProvider.anthropic
+                    ? 'Anthropic Claude — full tool-calling guardian (recommended).'
+                    : 'Gemini — text-only fallback (less reliable).',
+                style: const TextStyle(fontSize: 12, color: Color(0xFF8E8EA0)),
+              ),
+              // Gemini-only controls: the BYOK toggle is meaningless under
+              // Anthropic (which always uses your key), so only show it for Gemini.
+              if (_provider == AiProvider.gemini) ...[
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  value: _useBringYourOwnKey,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Use my own Gemini key'),
+                  subtitle: Text(
+                    usingConcierge
+                        ? hasConciergeKey
+                            ? 'Using the built-in Concierge Gemini key by default.'
+                            : 'No Concierge Gemini key is bundled in this build.'
+                        : 'Bring your own Gemini key.',
+                  ),
+                  onChanged: (value) {
+                    setState(() => _useBringYourOwnKey = value);
+                  },
                 ),
-                onChanged: (value) {
-                  setState(() => _useBringYourOwnKey = value);
-                },
-              ),
-              const SizedBox(height: 12),
-              _textField('Gemini model', _geminiModelController),
-              const SizedBox(height: 12),
-              _textField(
-                'Gemini API Key',
-                _geminiKeyController,
-                obscure: true,
-                enabled: _useBringYourOwnKey,
-              ),
-              const SizedBox(height: 12),
-              _textField('Anthropic model', _anthropicModelController),
-              const SizedBox(height: 12),
-              _textField(
-                'Anthropic API Key',
-                _anthropicKeyController,
-                obscure: true,
-              ),
+                const SizedBox(height: 12),
+                _textField('Gemini model', _geminiModelController),
+                const SizedBox(height: 12),
+                _textField(
+                  'Gemini API Key',
+                  _geminiKeyController,
+                  obscure: true,
+                  enabled: _useBringYourOwnKey,
+                ),
+              ],
+              // Anthropic-only controls.
+              if (_provider == AiProvider.anthropic) ...[
+                const SizedBox(height: 12),
+                _textField('Anthropic model', _anthropicModelController),
+                const SizedBox(height: 12),
+                _textField(
+                  'Anthropic API Key',
+                  _anthropicKeyController,
+                  obscure: true,
+                ),
+                const SizedBox(height: 12),
+                SwitchListTile.adaptive(
+                  value: _adaptiveThinking,
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text(
+                    'Let the guardian think on hard requests (adaptive)',
+                  ),
+                  subtitle: const Text(
+                    'The guardian reasons only when a negotiation genuinely '
+                    'needs it, and answers fast otherwise.',
+                  ),
+                  onChanged: (value) {
+                    setState(() => _adaptiveThinking = value);
+                  },
+                ),
+              ],
             ]),
             const SizedBox(height: 16),
             _card([
@@ -237,6 +356,20 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _timeRow('Wind down', _windDownTime, (t) => _windDownTime = t),
               _timeRow('Lockdown', _lockdownTime, (t) => _lockdownTime = t),
               _timeRow('Unlock', _unlockTime, (t) => _unlockTime = t),
+              if (_scheduleErrors.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                for (final err in _scheduleErrors)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      err,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFFFF3B30),
+                      ),
+                    ),
+                  ),
+              ],
             ]),
             const SizedBox(height: 16),
             _card([
@@ -290,7 +423,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               _textField('Poke API Key', _pokeKeyController, obscure: true),
               const SizedBox(height: 10),
               const Text(
-                'Windows enforcement is best-effort: always-on-top, fullscreen, prevent-close, and taskbar hiding. Android uses device-admin and lock-task hooks where available.',
+                'Windows enforcement is best-effort: always-on-top, fullscreen, prevent-close, and taskbar hiding. Android shows a Play-compliant lock overlay over blocked apps, using usage access to see which app is in front (with an optional accessibility helper for faster reactions). It never uses device-admin or kiosk lock-task.',
                 style: TextStyle(
                   fontSize: 13,
                   color: Color(0xFF8E8EA0),
@@ -298,6 +431,46 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 ),
               ),
             ]),
+            if (Platform.isAndroid) ...[
+              const SizedBox(height: 16),
+              _card([
+                _sectionTitle('Android'),
+                const SizedBox(height: 10),
+                const Text(
+                  'Manage the permissions the background guardian needs, and '
+                  'choose which apps the guardian is allowed to unlock during '
+                  'lockdown.',
+                  style: TextStyle(
+                      fontSize: 13, color: Color(0xFF8E8EA0), height: 1.5),
+                ),
+                const SizedBox(height: 12),
+                _navTile(
+                  Icons.shield_outlined,
+                  'Permissions',
+                  'Notifications, overlay, usage access, alarms, battery',
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => PermissionsOnboardingScreen(
+                        onComplete: () => Navigator.of(context).pop(),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                _navTile(
+                  Icons.apps_rounded,
+                  'Apps the guardian can unlock',
+                  'Opt in the apps the guardian may free during lockdown',
+                  () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const AllowlistEditorScreen(),
+                    ),
+                  ),
+                ),
+              ]),
+            ],
             const SizedBox(height: 16),
             _card([
               _sectionTitle('Guardian policy'),
@@ -360,6 +533,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: children,
+      ),
+    );
+  }
+
+  Widget _navTile(
+    IconData icon,
+    String title,
+    String subtitle,
+    VoidCallback onTap,
+  ) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(12),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 6),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: const Color(0xFF5B5FEF).withAlpha(24),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Icon(icon, color: const Color(0xFF5B5FEF), size: 22),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(title,
+                      style: const TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w500,
+                          color: Color(0xFF1A1A2E))),
+                  Text(subtitle,
+                      style: const TextStyle(
+                          fontSize: 12, color: Color(0xFF8E8EA0))),
+                ],
+              ),
+            ),
+            const Icon(Icons.chevron_right_rounded, color: Color(0xFF8E8EA0)),
+          ],
+        ),
       ),
     );
   }

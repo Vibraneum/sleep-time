@@ -152,7 +152,7 @@ class MemoryService {
     final dbPath = await appDataPath;
     _db = await openDatabase(
       p.join(dbPath, 'sleep_guardian.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE memories (
@@ -195,9 +195,145 @@ class MemoryService {
             compliance_score REAL DEFAULT 1.0
           )
         ''');
+        await db.execute(_scheduleChangesSchema);
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(_scheduleChangesSchema);
+        }
       },
     );
     return _db!;
+  }
+
+  static const String _scheduleChangesSchema = '''
+    CREATE TABLE schedule_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      timestamp TEXT NOT NULL,
+      source TEXT NOT NULL,
+      field TEXT,
+      old_value TEXT,
+      new_value TEXT,
+      reason TEXT,
+      outcome TEXT
+    )
+  ''';
+
+  /// Audit a schedule change. Fire-and-forget; failures are swallowed to
+  /// match the rest of the persistence layer.
+  static Future<void> logScheduleChange({
+    required String source,
+    String? field,
+    String? oldValue,
+    String? newValue,
+    String? reason,
+    String? outcome,
+  }) async {
+    final db = await _safeDb;
+    if (db == null) return;
+    try {
+      await db.insert('schedule_changes', {
+        'timestamp': DateTime.now().toIso8601String(),
+        'source': source,
+        'field': field,
+        'old_value': oldValue,
+        'new_value': newValue,
+        'reason': reason,
+        'outcome': outcome,
+      });
+    } catch (_) {}
+  }
+
+  /// Tonight's AI schedule-edit usage, read back from the audit table. Counts
+  /// rows since 22:00 whose source is an AI source (`aiTonight`/`aiPermanent`)
+  /// and whose outcome was applied (granted). Returns:
+  /// - `editsUsed`: number of applied AI schedule edits tonight.
+  /// - `lockdownDelayMin`: summed *delay* (positive minutes) applied to the
+  ///   lockdown field vs the value it had before each edit.
+  /// - `wakeUpDriftMin` / `windDownDriftMin`: summed absolute drift (either
+  ///   direction) applied to those fields tonight, for the cumulative window
+  ///   drift cap.
+  ///
+  /// Old/new values are read from the structured `field`/`old_value`/`new_value`
+  /// columns (stored as deterministic `HH:MM` by [ScheduleStore]); no regex on
+  /// a Dart map toString(). Fail-safe: any DB error yields a zero budget.
+  static Future<
+      ({
+        int editsUsed,
+        int lockdownDelayMin,
+        int wakeUpDriftMin,
+        int windDownDriftMin,
+      })> getTonightAiScheduleBudget() async {
+    const empty = (
+      editsUsed: 0,
+      lockdownDelayMin: 0,
+      wakeUpDriftMin: 0,
+      windDownDriftMin: 0,
+    );
+    final db = await _safeDb;
+    if (db == null) return empty;
+    try {
+      // Anchor "tonight" to the most recent 22:00 boundary. After midnight
+      // (00:00–21:59) that is YESTERDAY's 22:00, not today's — otherwise the
+      // edit-budget window collapses to nothing overnight and the cap reopens.
+      final now = DateTime.now();
+      var tonight = DateTime(now.year, now.month, now.day, 22);
+      if (now.isBefore(tonight)) {
+        tonight = tonight.subtract(const Duration(days: 1));
+      }
+      final rows = await db.query(
+        'schedule_changes',
+        where: "timestamp > ? AND source IN ('aiTonight', 'aiPermanent') "
+            "AND outcome = 'granted'",
+        whereArgs: [tonight.toIso8601String()],
+        orderBy: 'timestamp ASC',
+      );
+      var editsUsed = 0;
+      var lockdownDelayMin = 0;
+      var wakeUpDriftMin = 0;
+      var windDownDriftMin = 0;
+      const day = 24 * 60;
+      for (final row in rows) {
+        editsUsed++;
+        final field = row['field'] as String?;
+        if (field == null) continue;
+        final oldMin = _minutesFromHhmm(row['old_value'] as String?);
+        final newMin = _minutesFromHhmm(row['new_value'] as String?);
+        if (oldMin == null || newMin == null) continue;
+        var delta = newMin - oldMin;
+        // Wrap-aware shorter direction (e.g. 23:30 -> 00:15 = +45).
+        if (delta > day ~/ 2) delta -= day;
+        if (delta < -day ~/ 2) delta += day;
+        switch (field) {
+          case 'lockdown':
+            if (delta > 0) lockdownDelayMin += delta;
+          case 'wakeUp':
+            wakeUpDriftMin += delta.abs();
+          case 'windDown':
+            windDownDriftMin += delta.abs();
+        }
+      }
+      return (
+        editsUsed: editsUsed,
+        lockdownDelayMin: lockdownDelayMin,
+        wakeUpDriftMin: wakeUpDriftMin,
+        windDownDriftMin: windDownDriftMin,
+      );
+    } catch (_) {
+      return empty;
+    }
+  }
+
+  /// Parse a stored `HH:MM` audit value into minutes-of-day. Returns null when
+  /// the string is missing or malformed.
+  static int? _minutesFromHhmm(String? value) {
+    if (value == null) return null;
+    final parts = value.split(':');
+    if (parts.length != 2) return null;
+    final h = int.tryParse(parts[0]);
+    final m = int.tryParse(parts[1]);
+    if (h == null || m == null) return null;
+    return (h * 60) + m;
   }
 
   // --- Memories ---
@@ -344,6 +480,7 @@ class MemoryService {
     final compliance = await getComplianceRate();
     final tonightGrants = await getTonightGrantCount();
     final memories = await getActiveMemories();
+    final aiBudget = await getTonightAiScheduleBudget();
 
     final buf = StringBuffer();
     buf.writeln('== YOUR MEMORY ==\n');
@@ -352,6 +489,10 @@ class MemoryService {
       'compliance rate (7 days): ${(compliance * 100).toStringAsFixed(0)}%',
     );
     buf.writeln('grants used tonight: $tonightGrants');
+    // Schedule-nudge budget so repeated asks are visible — the model can't
+    // pretend tonight's allowance is fresh after it has already spent it.
+    buf.writeln('schedule edits made tonight: ${aiBudget.editsUsed} of 3 '
+        '(bedtime delayed ${aiBudget.lockdownDelayMin} of 90 min)');
     buf.writeln('');
 
     if (negotiations.isNotEmpty) {

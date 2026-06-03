@@ -1,9 +1,11 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import '../core/lockdown_scheduler.dart';
 import '../core/config.dart';
 import '../core/memory_service.dart';
+import '../core/negotiation_engine.dart';
+import '../core/schedule_store.dart';
 import '../platform/android_lockdown.dart';
 import '../platform/windows_lockdown.dart';
 import 'lockdown_screen.dart';
@@ -22,42 +24,155 @@ class _HomeScreenState extends State<HomeScreen> {
   LockdownState _currentState = LockdownState.unlocked;
   Duration? _grantRemaining;
 
+  /// The negotiation engine is owned HERE, above the LockdownScreen lifecycle,
+  /// so its conversation history survives grant -> relock (which destroys and
+  /// rebuilds the LockdownScreen). A new LockdownScreen reuses the SAME engine,
+  /// and startSession() is idempotent within a lock-night — so re-opening the
+  /// chat after a grant recalls everything instead of re-greeting from scratch.
+  final NegotiationEngine _engine = NegotiationEngine();
+
+  /// Whether the previous lockdown state was a SELECTIVE (per-app) grant. Used
+  /// on re-lock to snap the overlay back to full screen (the corner HUD) — a
+  /// plain activate() no-ops while already "locked".
+  bool _wasSelectiveGrant = false;
+
+  /// Subscription to native Android guardian state events. Null off-Android.
+  StreamSubscription<AndroidGuardianEvent>? _androidEventSub;
+
+  /// True when the native alarm scheduler fell back to inexact alarms (the user
+  /// hasn't granted exact-alarm access). Surfaced as a dismissible banner.
+  bool _alarmsDegraded = false;
+  bool _degradedBannerDismissed = false;
+
+  /// Whether the LockdownScreen route is currently pushed on top of this (still
+  /// mounted) HomeScreen. HomeScreen MUST stay mounted underneath the overlay so
+  /// its scheduler keeps ticking and can detect the morning unlock boundary —
+  /// hence we push (not pushAndRemoveUntil) and pop back here on release. The
+  /// guard prevents pushing a duplicate LockdownScreen (each push would build a
+  /// second overlay on top of the first).
+  bool _lockdownRouteOpen = false;
+
   @override
   void initState() {
     super.initState();
     _complianceFuture = MemoryService.getComplianceRate();
+    if (Platform.isAndroid) {
+      _androidEventSub = AndroidLockdown.events().listen((event) {
+        if (!mounted) return;
+        if (event.degraded != _alarmsDegraded) {
+          setState(() => _alarmsDegraded = event.degraded);
+        }
+      });
+    }
     _scheduler = LockdownScheduler(
       onStateChange: _onStateChange,
-      onGrantTick: (remaining) => setState(() => _grantRemaining = remaining),
-      onGrantExpired: () {
-        setState(() => _grantRemaining = null);
-        _onStateChange(LockdownState.locked);
+      onGrantTick: (remaining) {
+        setState(() => _grantRemaining = remaining);
+        // Wire the grant-expiry warning to a proactive guardian turn at ~2 min
+        // remaining (fires once per grant — guarded inside _maybeWarnExpiry).
+        _maybeWarnGrantExpiry(remaining);
       },
+      onGrantExpired: () {
+        // The scheduler's grant timer ALREADY recomputed to `locked` and
+        // emitted onStateChange(locked) before calling us. Re-emitting
+        // _onStateChange(locked) here caused a SECOND pushAndRemoveUntil and a
+        // double re-lock race. So we only clear the countdown label.
+        setState(() => _grantRemaining = null);
+      },
+      onSelectiveGrant: (allow, minutes) => unawaited(
+        WindowsLockdown.grantSelective(
+          allowImageNames: allow,
+          durationMinutes: minutes,
+        ),
+      ),
     );
     _scheduler.start();
   }
 
+  /// Tracks whether the grant-expiry warning already fired for the current
+  /// grant so the proactive ping happens at most once per grant.
+  bool _grantExpiryWarned = false;
+
+  void _maybeWarnGrantExpiry(Duration remaining) {
+    if (remaining.inSeconds <= 0) {
+      _grantExpiryWarned = false;
+      return;
+    }
+    // Fire once in the 2-minute window. Reset above when the grant ends.
+    if (!_grantExpiryWarned &&
+        remaining.inSeconds <= 120 &&
+        remaining.inSeconds > 110) {
+      _grantExpiryWarned = true;
+      if (AppConfig.hasUsableAiKey) {
+        unawaited(_engine.negotiateProactive(ProactiveTrigger.grantExpiring));
+      }
+    }
+  }
+
   void _onStateChange(LockdownState state) {
     if (!mounted) return;
+    // Capture whether we are LEAVING a selective grant before we overwrite
+    // _currentState — used to decide whether re-lock must restoreFull().
+    final leavingSelectiveGrant =
+        _currentState == LockdownState.granted && _wasSelectiveGrant;
     setState(() {
       _currentState = state;
       if (state == LockdownState.unlocked) {
         _complianceFuture = MemoryService.getComplianceRate();
+        // Night over: reset the engine so tomorrow starts a fresh conversation,
+        // and clear the grant-expiry warning latch.
+        _grantExpiryWarned = false;
+        unawaited(_engine.resetSession());
+      }
+      if (state == LockdownState.granted) {
+        _wasSelectiveGrant = _scheduler.isSelectiveGrant;
+      } else if (state != LockdownState.granted) {
+        _wasSelectiveGrant = false;
       }
     });
-    unawaited(_syncPlatformLockdown(state));
-    if (state == LockdownState.locked) _showLockdownScreen();
+    unawaited(_syncPlatformLockdown(state, fromSelectiveGrant: leavingSelectiveGrant));
+    // Drive navigation centrally from state. HomeScreen stays mounted underneath
+    // the overlay the whole time (so the scheduler keeps ticking and will hit
+    // the morning unlock boundary), and the LockdownScreen is pushed/popped on
+    // top of it.
+    if (state == LockdownState.locked || state == LockdownState.granted) {
+      _showLockdownScreen();
+    } else {
+      // unlocked / awake / windDown / inactive: tear the overlay down and return
+      // to the still-mounted HomeScreen. This is what makes morning disengage —
+      // _syncPlatformLockdown(unlocked) above already deactivated the platform.
+      _dismissLockdownScreen();
+    }
   }
 
-  Future<void> _syncPlatformLockdown(LockdownState state) async {
+  Future<void> _syncPlatformLockdown(
+    LockdownState state, {
+    bool fromSelectiveGrant = false,
+  }) async {
     switch (state) {
       case LockdownState.locked:
-        await WindowsLockdown.activate();
+        // Re-locking after a SELECTIVE grant: the overlay is still "locked" (the
+        // armed corner HUD), so a plain activate() no-ops and the HUD never
+        // snaps back to full screen. restoreFull() forces the full overlay back.
+        if (fromSelectiveGrant) {
+          await WindowsLockdown.restoreFull();
+        } else {
+          await WindowsLockdown.activate();
+        }
         await AndroidLockdown.activate();
         break;
       case LockdownState.granted:
-        await WindowsLockdown.grantExtension();
-        await AndroidLockdown.grantExtension();
+        // A selective (per-app) grant keeps the overlay armed via
+        // onSelectiveGrant → grantSelective; only a FULL grant fully restores.
+        if (!_scheduler.isSelectiveGrant) {
+          await WindowsLockdown.grantExtension();
+          // Full grant: suspend Android native enforcement until the grant
+          // expires so non-allowlisted apps aren't still blocked (#8). A
+          // selective grant instead uses the native allow-list path.
+          await AndroidLockdown.grantExtension(
+            untilEpochMs: _scheduler.grantExpiry?.millisecondsSinceEpoch,
+          );
+        }
         break;
       case LockdownState.unlocked:
       case LockdownState.awake:
@@ -69,16 +184,38 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Push the LockdownScreen ON TOP of this (still mounted) HomeScreen — a plain
+  /// push, NOT pushAndRemoveUntil, so HomeScreen survives as the root route and
+  /// its scheduler keeps ticking. The `_lockdownRouteOpen` guard ensures we
+  /// never stack a second overlay (e.g. on a granted transition while already
+  /// locked). LockdownScreen has PopScope(canPop:false) so Back can't escape.
   void _showLockdownScreen() {
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => LockdownScreen(scheduler: _scheduler)),
-      (route) => false,
-    );
+    if (_lockdownRouteOpen) return;
+    _lockdownRouteOpen = true;
+    Navigator.of(context)
+        .push(
+          MaterialPageRoute(
+            builder: (_) =>
+                LockdownScreen(scheduler: _scheduler, engine: _engine),
+          ),
+        )
+        .then((_) => _lockdownRouteOpen = false);
+  }
+
+  /// Pop back to the still-mounted HomeScreen (the first/root route) when the
+  /// state leaves lockdown — this is the morning-disengage path. No-op if the
+  /// overlay isn't open.
+  void _dismissLockdownScreen() {
+    if (!_lockdownRouteOpen) return;
+    _lockdownRouteOpen = false;
+    Navigator.of(context).popUntil((r) => r.isFirst);
   }
 
   @override
   void dispose() {
+    _androidEventSub?.cancel();
     _scheduler.dispose();
+    _engine.dispose();
     super.dispose();
   }
 
@@ -96,24 +233,32 @@ class _HomeScreenState extends State<HomeScreen> {
               const SizedBox(height: 28),
               _buildStatusCard(),
               const SizedBox(height: 16),
+              _buildDegradedAlarmBanner(),
+              _buildGuardianScheduleBanner(),
               _buildScheduleCard(),
               const SizedBox(height: 16),
               _buildStatsCard(),
-              if (kDebugMode) ...[
-                const SizedBox(height: 24),
-                Center(
-                  child: TextButton(
-                    onPressed: _showLockdownScreen,
-                    child: Text(
-                      'Test Lockdown',
-                      style: TextStyle(
-                        color: Colors.grey.shade400,
-                        fontSize: 12,
-                      ),
+              const SizedBox(height: 24),
+              Center(
+                // Manual "go to bed now": engages the REAL takeover immediately,
+                // independent of the schedule. forceLock() drives the scheduler
+                // into `locked`, firing _syncPlatformLockdown ->
+                // WindowsLockdown.activate() (fullscreen + always-on-top + key
+                // blocking + watchdog). The safe word / a grant releases it.
+                child: TextButton.icon(
+                  onPressed: () => _scheduler.forceLock(),
+                  icon: const Icon(Icons.nightlight_round,
+                      size: 16, color: Color(0xFF5B5FEF)),
+                  label: const Text(
+                    'Sleep now',
+                    style: TextStyle(
+                      color: Color(0xFF5B5FEF),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
                     ),
                   ),
                 ),
-              ],
+              ),
             ],
           ),
         ),
@@ -279,8 +424,140 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  /// Dismissible info banner shown when the native Android alarm scheduler had
+  /// to fall back to inexact alarms (no exact-alarm permission). Tells the user
+  /// lockdown timing may drift and links to settings to fix it.
+  Widget _buildDegradedAlarmBanner() {
+    if (!_alarmsDegraded || _degradedBannerDismissed) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 16),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: const Color(0xFFFFF3E0),
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: Row(
+          children: [
+            const Icon(
+              Icons.alarm_off_rounded,
+              color: Color(0xFFFF9500),
+              size: 20,
+            ),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Lockdown timing may drift',
+                    style: TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFFC76B00),
+                    ),
+                  ),
+                  SizedBox(height: 2),
+                  Text(
+                    'Exact alarms are off, so lockdown may start a little late. '
+                    'Enable exact alarms in Settings to fix this.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFFC76B00),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            GestureDetector(
+              onTap: () => setState(() => _degradedBannerDismissed = true),
+              child: const Icon(
+                Icons.close_rounded,
+                color: Color(0xFFC76B00),
+                size: 18,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGuardianScheduleBanner() {
+    return ListenableBuilder(
+      listenable: ScheduleStore.instance,
+      builder: (context, _) {
+        final source = ScheduleStore.instance.lastChangeSource;
+        final isAi = source == ScheduleSource.aiTonight ||
+            source == ScheduleSource.aiPermanent;
+        if (!isAi) return const SizedBox.shrink();
+        final note = ScheduleStore.instance.lastChangeNote;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 16),
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            decoration: BoxDecoration(
+              color: const Color(0xFFEEEEFC),
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Row(
+              children: [
+                const Icon(
+                  Icons.auto_awesome_rounded,
+                  color: Color(0xFF5B5FEF),
+                  size: 20,
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Guardian adjusted your schedule',
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF5B5FEF),
+                        ),
+                      ),
+                      if (note != null && note.trim().isNotEmpty) ...[
+                        const SizedBox(height: 2),
+                        Text(
+                          note,
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF5B5FEF),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+                GestureDetector(
+                  onTap: () =>
+                      ScheduleStore.instance.clearLastChangeNotice(),
+                  child: const Icon(
+                    Icons.close_rounded,
+                    color: Color(0xFF5B5FEF),
+                    size: 18,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
   Widget _buildScheduleCard() {
-    return Container(
+    return ListenableBuilder(
+      listenable: ScheduleStore.instance,
+      builder: (context, _) => Container(
       width: double.infinity,
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
@@ -335,6 +612,7 @@ class _HomeScreenState extends State<HomeScreen> {
             isLast: true,
           ),
         ],
+      ),
       ),
     );
   }
